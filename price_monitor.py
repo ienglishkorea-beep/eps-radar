@@ -1,143 +1,77 @@
 import requests
 import pandas as pd
-import time
 import os
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-def send_telegram(msg):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        return
+PROXIMITY_LEVEL = 0.98
 
+
+def send_telegram(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
-        "text": msg
+        "text": message
     }
-
-    requests.post(url, data=payload, timeout=20)
-REQUEST_SLEEP = 0.15
+    requests.post(url, data=payload)
 
 
-def load_watchlist():
-    dfs = []
+def get_quote(ticker):
+    url = f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={ticker}"
+    r = requests.get(url)
+    data = r.json()
 
-    for fname in ["top_candidates.csv", "multibagger_candidates.csv"]:
-        try:
-            df = pd.read_csv(fname)
-            if "ticker" in df.columns and not df.empty:
-                dfs.append(df[["ticker"]].copy())
-        except Exception:
-            continue
+    result = data["quoteResponse"]["result"]
 
-    if not dfs:
-        return []
-
-    watch = pd.concat(dfs, ignore_index=True).drop_duplicates()
-    return watch["ticker"].tolist()
-
-
-def get_quote_info(ticker):
-    try:
-        url = f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={ticker}"
-        headers = {"User-Agent": "Mozilla/5.0"}
-        r = requests.get(url, headers=headers, timeout=20)
-        data = r.json()
-
-        results = data.get("quoteResponse", {}).get("result", [])
-        if not results:
-            return None
-
-        q = results[0]
-
-        return {
-            "price": q.get("regularMarketPrice"),
-            "ma200": q.get("twoHundredDayAverage"),
-            "high_52w": q.get("fiftyTwoWeekHigh"),
-        }
-
-    except Exception:
+    if not result:
         return None
 
+    q = result[0]
 
-def get_20d_high(ticker):
-    try:
-        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?range=2mo&interval=1d"
-        headers = {"User-Agent": "Mozilla/5.0"}
-        r = requests.get(url, headers=headers, timeout=20)
-        data = r.json()
-
-        result = data.get("chart", {}).get("result")
-        if not result:
-            return None
-
-        closes = result[0].get("indicators", {}).get("quote", [{}])[0].get("close", [])
-        closes = [c for c in closes if c is not None]
-
-        if len(closes) < 20:
-            return None
-
-        return max(closes[-20:])
-
-    except Exception:
-        return None
+    return {
+        "price": q.get("regularMarketPrice"),
+        "high52": q.get("fiftyTwoWeekHigh")
+    }
 
 
 def main():
-    tickers = load_watchlist()
 
-    if not tickers:
-        pd.DataFrame(columns=[
-            "ticker", "price", "ma200", "high_52w", "high_20d",
-            "above_200ma", "near_52w_high", "breakout_20d"
-        ]).to_csv("price_alerts.csv", index=False)
-        print("No watchlist tickers.")
+    try:
+        df = pd.read_csv("top_candidates.csv")
+    except:
         return
 
-    rows = []
+    if df.empty:
+        return
 
-    for ticker in tickers:
-        quote = get_quote_info(ticker)
-        time.sleep(REQUEST_SLEEP)
-        high_20d = get_20d_high(ticker)
-        time.sleep(REQUEST_SLEEP)
+    alerts = []
+
+    for ticker in df["ticker"]:
+
+        quote = get_quote(ticker)
 
         if quote is None:
             continue
 
-        price = quote.get("price")
-        ma200 = quote.get("ma200")
-        high_52w = quote.get("high_52w")
+        price = quote["price"]
+        high52 = quote["high52"]
 
-        if price is None:
+        if price is None or high52 is None:
             continue
 
-        above_200ma = (ma200 is not None) and (price > ma200)
-        near_52w_high = (high_52w is not None) and (high_52w > 0) and (price / high_52w >= 0.98)
-        breakout_20d = (high_20d is not None) and (price >= high_20d)
+        proximity = price / high52
 
-        if above_200ma or near_52w_high or breakout_20d:
-            rows.append({
-                "ticker": ticker,
-                "price": price,
-                "ma200": ma200,
-                "high_52w": high_52w,
-                "high_20d": high_20d,
-                "above_200ma": above_200ma,
-                "near_52w_high": near_52w_high,
-                "breakout_20d": breakout_20d,
-            })
+        if proximity >= 1:
+            alerts.append(f"🚀 52W BREAKOUT: {ticker}  Price {price}")
 
-    alerts = pd.DataFrame(rows)
-    alerts.to_csv("price_alerts.csv", index=False)
+        elif proximity >= PROXIMITY_LEVEL:
+            alerts.append(f"⚠️ Near 52W High: {ticker}  Price {price}")
 
-    print("Done.")
-    print(f"Watchlist tickers: {len(tickers)}")
-    print(f"Price alerts: {len(alerts)}")
+    if alerts:
+        message = "Price Alert\n\n" + "\n".join(alerts)
+        send_telegram(message)
 
 
 if __name__ == "__main__":
     main()
-send_telegram("EPS Radar system online")
