@@ -27,12 +27,14 @@ jobs:
           pip install pandas requests lxml
 
       - name: Run EPS radar
-        run: python eps_radar.py
+        run: |
+          python eps_radar.py
 
       - name: Commit results
         run: |
           git config user.name "github-actions[bot]"
-          git config user.email "github-actions@github.com"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
           git add .
-          git commit -m "daily eps radar run" || echo "no changes"
-          git push origin main --force
+          git diff --cached --quiet || git commit -m "eps radar update"
+          git pull --rebase origin main || true
+          git push origin main || true
