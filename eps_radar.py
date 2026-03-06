@@ -808,16 +808,16 @@ def build_candidates(stage1, rev_speed_df, spy_ret_6m, sector_returns, min_high_
         )
 
         is_ultra = (
-            (revision_count in [2, 3])
-            and (rev_speed_tag == "REV_ACCEL")
-            and (growth_accel_tag == "ACCEL")
-            and (quality_proxy_tag == "QUALITY")
-            and (action == "BUY")
-            and (high_proximity >= 0.90)
-            and (volume_ratio >= 1.2)
-            and (guidance_signal in ["UP", "PROXY_UP"])
-            and (revenue_growth >= 0.20)
-        )
+    (revision_count in [2, 3])
+    and (rev_speed_count_30d >= 1)
+    and (growth_accel_tag == "ACCEL")
+    and (quality_proxy_tag == "QUALITY")
+    and (action == "BUY")
+    and (high_proximity >= 0.85)
+    and (volume_ratio >= 1.2)
+    and (guidance_signal in ["UP", "PROXY_UP"])
+    and (revenue_growth >= 0.15)
+)
 
         rows.append({
             "ticker": ticker,
