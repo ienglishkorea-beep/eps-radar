@@ -5,36 +5,90 @@ from io import StringIO
 import pandas as pd
 import requests
 
-# =========================================
-# FINAL RADAR SETTINGS
-# =========================================
-LOOKBACK_DAYS = 90
-REVISION_THRESHOLD = 3
-REQUEST_SLEEP = 0.12
-
-# 기본 후보 필터
-MIN_MARKET_CAP = 300_000_000          # $300M
-MIN_REVENUE_GROWTH = 0.15             # 15%
-MIN_HIGH_PROXIMITY = 0.80             # 52주 고점의 80% 이상
-MIN_RS_OVER_SPY = 0.00                # SPY보다 6개월 수익률 높아야 함
-MIN_AVG_DOLLAR_VOLUME = 5_000_000     # 평균 일거래대금 $5M 이상
-
-# 자동 완화
-AUTO_RELAX_IF_FINAL_LT = 5
-RELAXED_HIGH_PROXIMITY = 0.75
-
-# 멀티배거 후보 필터
-MIN_MULTIBAGGER_CAP = 2_000_000_000   # $2B
-MAX_MULTIBAGGER_CAP = 20_000_000_000  # $20B
-MIN_MULTIBAGGER_REVENUE_GROWTH = 0.20 # 20%
-MIN_MULTIBAGGER_HIGH_PROXIMITY = 0.90 # 52주 고점의 90% 이상
-
 USER_AGENT = {"User-Agent": "Mozilla/5.0"}
 
+# =========================================
+# FINAL EPS + MOMENTUM + SECTOR RADAR
+# INITIAL SIGNAL PRIORITY VERSION
+# =========================================
+
+# Universe / liquidity
+MIN_MARKET_CAP = 2_000_000_000          # $2B
+MIN_PRICE = 10.0
+MIN_AVG_DOLLAR_VOLUME = 10_000_000      # $10M
+
+# EPS revision
+LOOKBACK_DAYS = 90
+REVISION_THRESHOLD = 2
+REQUEST_SLEEP = 0.10
+
+# Growth / trend / breakout
+MIN_REVENUE_GROWTH = 0.15               # 15%
+MIN_HIGH_PROXIMITY = 0.80               # within 20% of 52W high
+RELAXED_HIGH_PROXIMITY = 0.72
+AUTO_RELAX_IF_FINAL_LT = 5
+
+MIN_VOLUME_RATIO = 1.0
+MIN_RS_OVER_SPY = 0.00
+
+# Multibagger subset
+MIN_MULTIBAGGER_CAP = 2_000_000_000
+MAX_MULTIBAGGER_CAP = 25_000_000_000
+MIN_MULTIBAGGER_REVENUE_GROWTH = 0.20
+MIN_MULTIBAGGER_HIGH_PROXIMITY = 0.90
+MIN_MULTIBAGGER_VOLUME_RATIO = 1.2
+
+# Sector ETF mapping
+SECTOR_MAP = {
+    "Technology": "XLK",
+    "Semiconductors": "SMH",
+    "Consumer Cyclical": "XLY",
+    "Consumer Defensive": "XLP",
+    "Healthcare": "XLV",
+    "Financial Services": "XLF",
+    "Financial": "XLF",
+    "Industrials": "XLI",
+    "Energy": "XLE",
+    "Basic Materials": "XLB",
+    "Materials": "XLB",
+    "Real Estate": "XLRE",
+    "Utilities": "XLU",
+    "Communication Services": "XLC",
+}
+
+OUTPUT_COLS = [
+    "ticker",
+    "score",
+    "revision_count",
+    "revenue_growth",
+    "price",
+    "entry_price",
+    "stop_price",
+    "high_20d",
+    "market_cap",
+    "sector",
+    "sector_etf",
+    "ret_6m",
+    "sector_ret_6m",
+    "spy_ret_6m",
+    "ma50",
+    "ma200",
+    "high_52w",
+    "high_proximity",
+    "volume",
+    "avg_volume_3m",
+    "volume_ratio",
+    "avg_dollar_volume",
+]
+
 
 # =========================================
-# UNIVERSE
+# Helpers
 # =========================================
+def clamp01(x: float) -> float:
+    return max(0.0, min(1.0, x))
+
+
 def get_sp1500_tickers():
     urls = [
         "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
@@ -54,9 +108,6 @@ def get_sp1500_tickers():
     return sorted(list(set(tickers)))
 
 
-# =========================================
-# EPS ESTIMATE
-# =========================================
 def get_eps_estimate(ticker: str):
     try:
         url = (
@@ -71,7 +122,6 @@ def get_eps_estimate(ticker: str):
             return None
 
         trends = result[0].get("earningsTrend", {}).get("trend", [])
-
         for trend in trends:
             if trend.get("period") == "+1y":
                 current = trend.get("epsTrend", {}).get("current", {}).get("raw")
@@ -79,14 +129,10 @@ def get_eps_estimate(ticker: str):
                     return float(current)
 
         return None
-
     except Exception:
         return None
 
 
-# =========================================
-# HISTORY
-# =========================================
 def load_history():
     try:
         df = pd.read_csv("eps_history.csv")
@@ -96,9 +142,6 @@ def load_history():
         return pd.DataFrame(columns=["date", "ticker", "eps", "up_revision"])
 
 
-# =========================================
-# QUOTE / PRICE
-# =========================================
 def get_quote_info(ticker: str):
     try:
         url = f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={ticker}"
@@ -110,15 +153,16 @@ def get_quote_info(ticker: str):
             return None
 
         q = results[0]
-
         return {
             "price": q.get("regularMarketPrice"),
             "market_cap": q.get("marketCap"),
+            "ma50": q.get("fiftyDayAverage"),
             "ma200": q.get("twoHundredDayAverage"),
             "high_52w": q.get("fiftyTwoWeekHigh"),
+            "volume": q.get("regularMarketVolume"),
             "avg_volume_3m": q.get("averageDailyVolume3Month"),
+            "sector": q.get("sector"),
         }
-
     except Exception:
         return None
 
@@ -135,30 +179,40 @@ def get_6m_return(ticker: str):
 
         closes = result[0].get("indicators", {}).get("quote", [{}])[0].get("close", [])
         closes = [c for c in closes if c is not None]
-
         if len(closes) < 2:
             return None
 
         start_price = closes[0]
         end_price = closes[-1]
-
         if start_price in [0, None]:
             return None
 
         return (end_price / start_price) - 1
-
     except Exception:
         return None
 
 
-# =========================================
-# FUNDAMENTALS
-# =========================================
+def get_20d_high(ticker: str):
+    try:
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?range=1mo&interval=1d"
+        r = requests.get(url, headers=USER_AGENT, timeout=20)
+        data = r.json()
+
+        result = data.get("chart", {}).get("result")
+        if not result:
+            return None
+
+        highs = result[0].get("indicators", {}).get("quote", [{}])[0].get("high", [])
+        highs = [h for h in highs if h is not None]
+        if not highs:
+            return None
+
+        return max(highs)
+    except Exception:
+        return None
+
+
 def get_revenue_growth(ticker: str):
-    """
-    Yahoo financialData.revenueGrowth 사용
-    0.15 = YoY 매출 성장률 15%
-    """
     try:
         url = (
             f"https://query2.finance.yahoo.com/v10/finance/quoteSummary/"
@@ -181,42 +235,252 @@ def get_revenue_growth(ticker: str):
             return None
 
         return float(raw)
-
     except Exception:
         return None
 
 
+def get_sector_etf(sector_name):
+    if not sector_name:
+        return None
+    return SECTOR_MAP.get(sector_name)
+
+
 # =========================================
-# OUTPUT HELPERS
+# Initial-signal scoring
 # =========================================
+def get_eps_score(revision_count: int) -> float:
+    """
+    Initial signal priority:
+    2 revisions = strongest early signal
+    3 revisions = still very strong
+    4 revisions = later confirmation
+    5+ revisions = already known / later stage
+    """
+    if revision_count == 2:
+        return 1.00
+    elif revision_count == 3:
+        return 0.90
+    elif revision_count == 4:
+        return 0.70
+    else:
+        return 0.50
+
+
+def get_revenue_score(revenue_growth: float) -> float:
+    """
+    Favors real business acceleration proxy.
+    """
+    if revenue_growth >= 0.30:
+        return 1.00
+    elif revenue_growth >= 0.20:
+        return 0.80
+    elif revenue_growth >= 0.15:
+        return 0.60
+    elif revenue_growth >= 0.10:
+        return 0.30
+    else:
+        return 0.0
+
+
+def compute_score(
+    revision_count,
+    revenue_growth,
+    ret_6m,
+    sector_ret_6m,
+    spy_ret_6m,
+    high_proximity,
+    volume_ratio,
+    price,
+    ma50,
+    ma200,
+):
+    eps_score = get_eps_score(revision_count)
+    rev_score = get_revenue_score(revenue_growth)
+
+    # Trend score
+    trend_parts = 0.0
+    if price > ma50:
+        trend_parts += 0.35
+    if price > ma200:
+        trend_parts += 0.35
+
+    rs_vs_spy = ret_6m - spy_ret_6m
+    trend_parts += 0.30 * clamp01(rs_vs_spy / 0.30)
+    trend_score = clamp01(trend_parts)
+
+    # Breakout proximity: 80%=0, 100%=1
+    prox_score = clamp01((high_proximity - 0.80) / 0.20)
+
+    # Volume: 1.0x=0, 2.5x=1
+    vol_score = clamp01((volume_ratio - 1.0) / 1.5)
+
+    # Strong sector
+    sector_score = 1.0 if sector_ret_6m > spy_ret_6m else 0.0
+
+    # Strong stock within strong sector
+    stock_sector_score = 1.0 if ret_6m > sector_ret_6m else 0.0
+
+    # Initial-signal priority weights
+    score = (
+        35 * eps_score +
+        25 * rev_score +
+        15 * trend_score +
+        10 * prox_score +
+        5 * vol_score +
+        5 * sector_score +
+        5 * stock_sector_score
+    )
+    return round(score, 2)
+
+
 def save_empty_outputs():
-    empty_cols = [
-        "ticker",
-        "revision_count",
-        "market_cap",
-        "price",
-        "ma200",
-        "ret_6m",
-        "spy_ret_6m",
-        "high_52w",
-        "high_proximity",
-        "revenue_growth",
-        "avg_dollar_volume",
-    ]
-
-    pd.DataFrame(columns=empty_cols).to_csv("eps_candidates.csv", index=False)
-    pd.DataFrame(columns=empty_cols).to_csv("top_candidates.csv", index=False)
-    pd.DataFrame(columns=empty_cols).to_csv("multibagger_candidates.csv", index=False)
+    empty = pd.DataFrame(columns=OUTPUT_COLS)
+    empty.to_csv("eps_candidates.csv", index=False)
+    empty.to_csv("top_candidates.csv", index=False)
+    empty.to_csv("multibagger_candidates.csv", index=False)
 
 
-# =========================================
-# MAIN
-# =========================================
+def build_candidates(stage1, spy_ret_6m, sector_returns, min_high_proximity):
+    rows = []
+
+    for _, row in stage1.iterrows():
+        ticker = row["ticker"]
+        revision_count = int(row["revision_count"])
+
+        quote = get_quote_info(ticker)
+        time.sleep(REQUEST_SLEEP)
+
+        ret_6m = get_6m_return(ticker)
+        time.sleep(REQUEST_SLEEP)
+
+        revenue_growth = get_revenue_growth(ticker)
+        time.sleep(REQUEST_SLEEP)
+
+        high_20d = get_20d_high(ticker)
+        time.sleep(REQUEST_SLEEP)
+
+        if quote is None or ret_6m is None or revenue_growth is None or high_20d is None:
+            continue
+
+        price = quote.get("price")
+        market_cap = quote.get("market_cap")
+        ma50 = quote.get("ma50")
+        ma200 = quote.get("ma200")
+        high_52w = quote.get("high_52w")
+        volume = quote.get("volume")
+        avg_volume_3m = quote.get("avg_volume_3m")
+        sector = quote.get("sector")
+
+        if (
+            price is None
+            or market_cap is None
+            or ma50 is None
+            or ma200 is None
+            or high_52w is None
+            or volume is None
+            or avg_volume_3m is None
+            or high_52w == 0
+            or avg_volume_3m == 0
+        ):
+            continue
+
+        # Sector ETF mapping
+        sector_etf = get_sector_etf(sector)
+        if sector_etf is None:
+            continue
+
+        sector_ret_6m = sector_returns.get(sector_etf)
+        if sector_ret_6m is None:
+            continue
+
+        # Universe
+        if market_cap < MIN_MARKET_CAP:
+            continue
+        if price < MIN_PRICE:
+            continue
+
+        avg_dollar_volume = price * avg_volume_3m
+        if avg_dollar_volume < MIN_AVG_DOLLAR_VOLUME:
+            continue
+
+        # Growth
+        if revenue_growth < MIN_REVENUE_GROWTH:
+            continue
+
+        # Trend
+        if price <= ma50:
+            continue
+        if price <= ma200:
+            continue
+        if (ret_6m - spy_ret_6m) <= MIN_RS_OVER_SPY:
+            continue
+
+        # Strong sector / strong stock
+        if sector_ret_6m <= spy_ret_6m:
+            continue
+        if ret_6m <= sector_ret_6m:
+            continue
+
+        # Breakout proximity
+        high_proximity = price / high_52w
+        if high_proximity < min_high_proximity:
+            continue
+
+        # Volume
+        volume_ratio = volume / avg_volume_3m
+        if volume_ratio < MIN_VOLUME_RATIO:
+            continue
+
+        # Entry / Stop
+        entry_price = max(high_20d * 1.01, price * 1.02)
+        stop_price = entry_price * 0.85
+
+        score = compute_score(
+            revision_count=revision_count,
+            revenue_growth=revenue_growth,
+            ret_6m=ret_6m,
+            sector_ret_6m=sector_ret_6m,
+            spy_ret_6m=spy_ret_6m,
+            high_proximity=high_proximity,
+            volume_ratio=volume_ratio,
+            price=price,
+            ma50=ma50,
+            ma200=ma200,
+        )
+
+        rows.append({
+            "ticker": ticker,
+            "score": score,
+            "revision_count": revision_count,
+            "revenue_growth": revenue_growth,
+            "price": price,
+            "entry_price": round(entry_price, 2),
+            "stop_price": round(stop_price, 2),
+            "high_20d": round(high_20d, 2),
+            "market_cap": market_cap,
+            "sector": sector,
+            "sector_etf": sector_etf,
+            "ret_6m": ret_6m,
+            "sector_ret_6m": sector_ret_6m,
+            "spy_ret_6m": spy_ret_6m,
+            "ma50": ma50,
+            "ma200": ma200,
+            "high_52w": high_52w,
+            "high_proximity": high_proximity,
+            "volume": volume,
+            "avg_volume_3m": avg_volume_3m,
+            "volume_ratio": volume_ratio,
+            "avg_dollar_volume": avg_dollar_volume,
+        })
+
+    return pd.DataFrame(rows)
+
+
 def main():
     today = pd.Timestamp(dt.date.today())
     tickers = get_sp1500_tickers()
 
-    # 1) 오늘 EPS 스냅샷 수집
+    # 1) EPS snapshot
     rows = []
     for ticker in tickers:
         eps = get_eps_estimate(ticker)
@@ -229,13 +493,13 @@ def main():
 
     today_df = pd.DataFrame(rows)
 
-    # 2) 히스토리 누적
+    # 2) History
     history = load_history()
     history = pd.concat([history[["date", "ticker", "eps"]], today_df], ignore_index=True)
     history = history.drop_duplicates(subset=["date", "ticker"], keep="last")
     history = history.sort_values(["ticker", "date"]).reset_index(drop=True)
 
-    # 3) 전일 대비 EPS 상향 여부
+    # 3) Revisions
     history["prev_eps"] = history.groupby("ticker")["eps"].shift(1)
     history["up_revision"] = (
         history["eps"].notna()
@@ -246,7 +510,7 @@ def main():
     save_history = history[["date", "ticker", "eps", "up_revision"]].copy()
     save_history.to_csv("eps_history.csv", index=False)
 
-    # 4) 최근 90일 EPS 상향 횟수
+    # 4) Stage1 raw
     cutoff = pd.Timestamp.today().normalize() - pd.Timedelta(days=LOOKBACK_DAYS)
     recent = save_history[save_history["date"] >= cutoff]
 
@@ -257,213 +521,76 @@ def main():
     )
 
     stage1 = summary[summary["revision_count"] >= REVISION_THRESHOLD].copy()
+    stage1.to_csv("eps_stage1_raw.csv", index=False)
 
     if stage1.empty:
         save_empty_outputs()
         print("Done.")
         print(f"Tickers processed: {len(tickers)}")
-        print("Stage1 candidates: 0")
+        print("Stage1 raw: 0")
         print("Final candidates: 0")
         print("Multibagger candidates: 0")
         return
 
-    # 5) SPY 상대강도 기준
+    # 5) Benchmark returns
     spy_ret_6m = get_6m_return("SPY")
     time.sleep(REQUEST_SLEEP)
 
     if spy_ret_6m is None:
         save_empty_outputs()
         print("Done.")
-        print(f"Tickers processed: {len(tickers)}")
         print("SPY return fetch failed")
         return
 
-    # 6) 기본 필터 적용
-    final_rows = []
-
-    for _, row in stage1.iterrows():
-        ticker = row["ticker"]
-        revision_count = row["revision_count"]
-
-        quote = get_quote_info(ticker)
+    sector_etfs = sorted(set(SECTOR_MAP.values()))
+    sector_returns = {}
+    for etf in sector_etfs:
+        sector_returns[etf] = get_6m_return(etf)
         time.sleep(REQUEST_SLEEP)
 
-        ret_6m = get_6m_return(ticker)
-        time.sleep(REQUEST_SLEEP)
+    # 6) Main pass
+    final_df = build_candidates(stage1, spy_ret_6m, sector_returns, MIN_HIGH_PROXIMITY)
 
-        revenue_growth = get_revenue_growth(ticker)
-        time.sleep(REQUEST_SLEEP)
-
-        if quote is None or ret_6m is None or revenue_growth is None:
-            continue
-
-        price = quote.get("price")
-        market_cap = quote.get("market_cap")
-        ma200 = quote.get("ma200")
-        high_52w = quote.get("high_52w")
-        avg_volume_3m = quote.get("avg_volume_3m")
-
-        if (
-            price is None
-            or market_cap is None
-            or ma200 is None
-            or high_52w is None
-            or avg_volume_3m is None
-            or high_52w == 0
-        ):
-            continue
-
-        # 시총
-        if market_cap < MIN_MARKET_CAP:
-            continue
-
-        # MA200 위
-        if price <= ma200:
-            continue
-
-        # SPY 대비 상대강도 우위
-        if (ret_6m - spy_ret_6m) <= MIN_RS_OVER_SPY:
-            continue
-
-        # 매출 성장
-        if revenue_growth < MIN_REVENUE_GROWTH:
-            continue
-
-        # 유동성(평균 일거래대금)
-        avg_dollar_volume = price * avg_volume_3m
-        if avg_dollar_volume < MIN_AVG_DOLLAR_VOLUME:
-            continue
-
-        # 52주 고점 근접
-        high_proximity = price / high_52w
-        if high_proximity < MIN_HIGH_PROXIMITY:
-            continue
-
-        final_rows.append({
-            "ticker": ticker,
-            "revision_count": revision_count,
-            "market_cap": market_cap,
-            "price": price,
-            "ma200": ma200,
-            "ret_6m": ret_6m,
-            "spy_ret_6m": spy_ret_6m,
-            "high_52w": high_52w,
-            "high_proximity": high_proximity,
-            "revenue_growth": revenue_growth,
-            "avg_dollar_volume": avg_dollar_volume,
-        })
-
-    final_df = pd.DataFrame(final_rows)
-
-    # 7) 후보 너무 적으면 52주 고점 조건 자동 완화
+    # 7) Auto relax
     if len(final_df) < AUTO_RELAX_IF_FINAL_LT:
-        relaxed_rows = []
-
-        for _, row in stage1.iterrows():
-            ticker = row["ticker"]
-            revision_count = row["revision_count"]
-
-            quote = get_quote_info(ticker)
-            time.sleep(REQUEST_SLEEP)
-
-            ret_6m = get_6m_return(ticker)
-            time.sleep(REQUEST_SLEEP)
-
-            revenue_growth = get_revenue_growth(ticker)
-            time.sleep(REQUEST_SLEEP)
-
-            if quote is None or ret_6m is None or revenue_growth is None:
-                continue
-
-            price = quote.get("price")
-            market_cap = quote.get("market_cap")
-            ma200 = quote.get("ma200")
-            high_52w = quote.get("high_52w")
-            avg_volume_3m = quote.get("avg_volume_3m")
-
-            if (
-                price is None
-                or market_cap is None
-                or ma200 is None
-                or high_52w is None
-                or avg_volume_3m is None
-                or high_52w == 0
-            ):
-                continue
-
-            if market_cap < MIN_MARKET_CAP:
-                continue
-
-            if price <= ma200:
-                continue
-
-            if (ret_6m - spy_ret_6m) <= MIN_RS_OVER_SPY:
-                continue
-
-            if revenue_growth < MIN_REVENUE_GROWTH:
-                continue
-
-            avg_dollar_volume = price * avg_volume_3m
-            if avg_dollar_volume < MIN_AVG_DOLLAR_VOLUME:
-                continue
-
-            high_proximity = price / high_52w
-            if high_proximity < RELAXED_HIGH_PROXIMITY:
-                continue
-
-            relaxed_rows.append({
-                "ticker": ticker,
-                "revision_count": revision_count,
-                "market_cap": market_cap,
-                "price": price,
-                "ma200": ma200,
-                "ret_6m": ret_6m,
-                "spy_ret_6m": spy_ret_6m,
-                "high_52w": high_52w,
-                "high_proximity": high_proximity,
-                "revenue_growth": revenue_growth,
-                "avg_dollar_volume": avg_dollar_volume,
-            })
-
-        final_df = pd.DataFrame(relaxed_rows)
+        final_df = build_candidates(stage1, spy_ret_6m, sector_returns, RELAXED_HIGH_PROXIMITY)
 
     if final_df.empty:
         save_empty_outputs()
         print("Done.")
         print(f"Tickers processed: {len(tickers)}")
-        print(f"Stage1 candidates: {len(stage1)}")
+        print(f"Stage1 raw: {len(stage1)}")
         print("Final candidates: 0")
         print("Multibagger candidates: 0")
         return
 
-    # 8) 정렬
+    # 8) Sort
     final_df = final_df.sort_values(
-        ["revision_count", "ret_6m", "high_proximity", "revenue_growth"],
+        ["score", "revision_count", "ret_6m", "high_proximity"],
         ascending=[False, False, False, False],
     ).reset_index(drop=True)
 
-    # 9) 전체 후보
+    final_df = final_df[OUTPUT_COLS]
     final_df.to_csv("eps_candidates.csv", index=False)
 
-    # 10) 상위 10개
     top_df = final_df.head(10).copy()
     top_df.to_csv("top_candidates.csv", index=False)
 
-    # 11) 멀티배거 후보
     multi_df = final_df[
         (final_df["market_cap"] >= MIN_MULTIBAGGER_CAP)
         & (final_df["market_cap"] <= MAX_MULTIBAGGER_CAP)
         & (final_df["revenue_growth"] >= MIN_MULTIBAGGER_REVENUE_GROWTH)
         & (final_df["high_proximity"] >= MIN_MULTIBAGGER_HIGH_PROXIMITY)
+        & (final_df["volume_ratio"] >= MIN_MULTIBAGGER_VOLUME_RATIO)
     ].copy()
-
     multi_df.to_csv("multibagger_candidates.csv", index=False)
 
     print("Done.")
     print(f"Tickers processed: {len(tickers)}")
-    print(f"Stage1 candidates: {len(stage1)}")
+    print(f"Stage1 raw: {len(stage1)}")
     print(f"Final candidates: {len(final_df)}")
     print(f"Multibagger candidates: {len(multi_df)}")
+    print(f"SPY 6M return: {round(spy_ret_6m, 4)}")
 
 
 if __name__ == "__main__":
