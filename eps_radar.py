@@ -1,67 +1,106 @@
+import time
+import datetime as dt
+from typing import Optional, List
+
 import requests
 import pandas as pd
-import datetime
 
+# ===== 설정 =====
 TICKERS = [
-"NVDA","AVGO","ANET","MSFT","META","AMZN","TSLA","AMD","SMCI",
-"NOW","KLAC","LRCX","AMAT","ASML","CRWD","PANW","SNOW"
+    "NVDA","AVGO","ANET","MSFT","META","AMZN","TSLA","AMD","SMCI",
+    "NOW","KLAC","LRCX","AMAT","ASML","CRWD","PANW","SNOW"
 ]
-
 LOOKBACK_DAYS = 90
 REVISION_THRESHOLD = 3
+SLEEP_SEC = 0.8
 
-def get_eps_estimate(ticker):
+HISTORY_FILE = "eps_history.csv"
+TODAY_FILE = "eps_candidates.csv"
+
+UA = {"User-Agent": "Mozilla/5.0"}
+YF_QS = "https://query2.finance.yahoo.com/v10/finance/quoteSummary/{t}?modules=earningsTrend,price"
+
+def get_eps_estimate_fy1(ticker: str) -> Optional[float]:
     try:
-        url = f"https://query2.finance.yahoo.com/v10/finance/quoteSummary/{ticker}?modules=earningsTrend"
-        r = requests.get(url)
+        url = YF_QS.format(t=ticker)
+        r = requests.get(url, headers=UA, timeout=20)
+        r.raise_for_status()
         data = r.json()
 
-        trends = data["quoteSummary"]["result"][0]["earningsTrend"]["trend"]
+        res = data.get("quoteSummary", {}).get("result", None)
+        if not res:
+            return None
 
+        trends = res[0].get("earningsTrend", {}).get("trend", []) or []
         for t in trends:
-            if t["period"] == "+1y":
-                return t["epsTrend"]["current"]["raw"]
-
-    except:
+            if t.get("period") == "+1y":
+                cur = t.get("epsTrend", {}).get("current", {}).get("raw", None)
+                return float(cur) if cur is not None else None
+        return None
+    except Exception:
         return None
 
-def load_history():
+def load_history() -> pd.DataFrame:
     try:
-        return pd.read_csv("eps_history.csv")
-    except:
+        df = pd.read_csv(HISTORY_FILE)
+        df["date"] = pd.to_datetime(df["date"])
+        return df
+    except Exception:
         return pd.DataFrame(columns=["date","ticker","eps"])
 
 def main():
+    today = pd.to_datetime(dt.date.today().isoformat())
 
-    today = str(datetime.date.today())
-
-    history = load_history()
+    hist = load_history()
 
     rows = []
-
+    failed = 0
     for t in TICKERS:
-        eps = get_eps_estimate(t)
-        rows.append([today,t,eps])
+        eps = get_eps_estimate_fy1(t)
+        if eps is None:
+            failed += 1
+        rows.append({"date": today, "ticker": t, "eps": eps})
+        time.sleep(SLEEP_SEC)
 
-    df = pd.DataFrame(rows,columns=["date","ticker","eps"])
+    df_today = pd.DataFrame(rows)
 
-    history = pd.concat([history,df])
+    # 중복 제거 후 누적
+    hist = pd.concat([hist, df_today], ignore_index=True)
+    hist = hist.drop_duplicates(subset=["date","ticker"], keep="last")
+    hist = hist.sort_values(["ticker","date"])
 
-    history.to_csv("eps_history.csv",index=False)
+    # 리비전 계산(전일 대비 eps 상승)
+    hist["prev_eps"] = hist.groupby("ticker")["eps"].shift(1)
+    hist["up_revision"] = (
+        hist["eps"].notna() & hist["prev_eps"].notna() & (hist["eps"] > hist["prev_eps"])
+    ).astype(int)
 
-    history["prev"] = history.groupby("ticker")["eps"].shift(1)
+    # 최근 LOOKBACK_DAYS 내 카운트
+    cutoff = pd.Timestamp.today().normalize() - pd.Timedelta(days=LOOKBACK_DAYS)
+    recent = hist[hist["date"] >= cutoff]
 
-    history["revision"] = (history["eps"] > history["prev"]).astype(int)
+    agg = recent.groupby("ticker").agg(
+        up_rev_cnt=("up_revision","sum"),
+        eps_latest=("eps","last"),
+        last_date=("date","max")
+    ).reset_index()
 
-    cutoff = pd.Timestamp.today() - pd.Timedelta(days=LOOKBACK_DAYS)
+    cand = agg[agg["up_rev_cnt"] >= REVISION_THRESHOLD].sort_values(
+        ["up_rev_cnt","ticker"], ascending=[False, True]
+    )
 
-    recent = history[pd.to_datetime(history["date"]) >= cutoff]
+    # 저장
+    hist.drop(columns=["prev_eps"], errors="ignore").to_csv(HISTORY_FILE, index=False)
+    cand.to_csv(TODAY_FILE, index=False)
 
-    result = recent.groupby("ticker")["revision"].sum()
+    print("=== EPS Radar ===")
+    print(f"Date: {today.date().isoformat()}")
+    print(f"Tickers: {len(TICKERS)}, Failed: {failed}")
+    print(f"Saved: {HISTORY_FILE}, {TODAY_FILE}")
+    if cand.empty:
+        print("(no candidates)")
+    else:
+        print(cand.to_string(index=False))
 
-    candidates = result[result >= REVISION_THRESHOLD]
-
-    print("EPS REVISION CANDIDATES")
-    print(candidates)
-
-main()
+if __name__ == "__main__":
+    main()
