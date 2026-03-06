@@ -62,7 +62,7 @@ def load_history():
 
 
 def main():
-tickers = get_sp1500_tickers()
+    tickers = get_sp1500_tickers()
     today = pd.Timestamp(datetime.date.today())
 
     # 오늘 스냅샷 수집
