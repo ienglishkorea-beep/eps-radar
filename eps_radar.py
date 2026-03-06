@@ -115,15 +115,22 @@ def main():
     candidates = candidates.sort_values(["revision_count", "ticker"], ascending=[False, True])
 
     candidates.to_csv("eps_candidates.csv", index=False)
+    final_df.to_csv("eps_candidates.csv", index=False)
+
     top_df = final_df.head(10).copy()
     top_df.to_csv("top_candidates.csv", index=False)
 
-multi_df = final_df[
-    (final_df["market_cap"] >= 2_000_000_000) &
-    (final_df["market_cap"] <= 20_000_000_000)
-].copy()
+    multi_df = final_df[
+        (final_df["market_cap"] >= 2_000_000_000) &
+        (final_df["market_cap"] <= 20_000_000_000)
+    ].copy()
 
-multi_df.to_csv("multibagger_candidates.csv", index=False)
+    multi_df.to_csv("multibagger_candidates.csv", index=False)
+
+    print("Done.")
+    print(f"Tickers processed: {len(tickers)}")
+    print(f"Stage1 candidates: {len(stage1)}")
+    print(f"Final candidates: {len(final_df)}")
     print("Done.")
     print(f"Tickers processed: {len(tickers)}")
     print(f"Candidates found: {len(candidates)}")
