@@ -116,7 +116,7 @@ def main():
 
     candidates.to_csv("eps_candidates.csv", index=False)
     top_df = final_df.head(10).copy()
-top_df.to_csv("top_candidates.csv", index=False)
+    top_df.to_csv("top_candidates.csv", index=False)
 
 multi_df = final_df[
     (final_df["market_cap"] >= 2_000_000_000) &
