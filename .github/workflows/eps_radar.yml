@@ -5,30 +5,15 @@ on:
     - cron: "0 0 * * *"
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   run:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install libraries
-        run: |
-          pip install pandas requests
-
-      - name: Run radar
-        run: |
-          python eps_radar.py
-
-      - name: Save result
-        run: |
-          git config user.name "bot"
-          git config user.email "bot@github.com"
-          git add .
-          git commit -m "daily run" || echo "no changes"
-          git push
+      -
