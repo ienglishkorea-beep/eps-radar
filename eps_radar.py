@@ -1,16 +1,19 @@
 import requests
 import pandas as pd
 import datetime
-from io import StringIO
 import time
+from io import StringIO
 
 LOOKBACK_DAYS = 90
 REVISION_THRESHOLD = 3
 REQUEST_SLEEP = 0.15
 
+MIN_MARKET_CAP = 300_000_000
+MIN_HIGH_PROXIMITY = 0.85
+
 MIN_MULTIBAGGER_CAP = 2_000_000_000
 MAX_MULTIBAGGER_CAP = 20_000_000_000
-MIN_52W_HIGH_PROXIMITY = 0.85
+MIN_MULTIBAGGER_HIGH_PROXIMITY = 0.90
 
 
 def get_sp1500_tickers():
@@ -24,8 +27,8 @@ def get_sp1500_tickers():
     tickers = []
 
     for url in urls:
-        response = requests.get(url, headers=headers, timeout=20)
-        tables = pd.read_html(StringIO(response.text))
+        r = requests.get(url, headers=headers, timeout=20)
+        tables = pd.read_html(StringIO(r.text))
         symbols = tables[0]["Symbol"].tolist()
         tickers.extend(symbols)
 
@@ -80,16 +83,11 @@ def get_quote_info(ticker):
 
         q = results[0]
 
-        price = q.get("regularMarketPrice")
-        market_cap = q.get("marketCap")
-        ma200 = q.get("twoHundredDayAverage")
-        high_52w = q.get("fiftyTwoWeekHigh")
-
         return {
-            "price": price,
-            "market_cap": market_cap,
-            "ma200": ma200,
-            "high_52w": high_52w
+            "price": q.get("regularMarketPrice"),
+            "market_cap": q.get("marketCap"),
+            "ma200": q.get("twoHundredDayAverage"),
+            "high_52w": q.get("fiftyTwoWeekHigh"),
         }
 
     except Exception:
@@ -127,17 +125,19 @@ def get_6m_return(ticker):
 
 def save_empty_outputs():
     pd.DataFrame(columns=["ticker", "revision_count"]).to_csv("eps_candidates.csv", index=False)
-    pd.DataFrame(columns=["ticker", "revision_count"]).to_csv("top_candidates.csv", index=False)
     pd.DataFrame(columns=[
         "ticker", "revision_count", "market_cap", "price", "ma200",
-        "ret_6m", "spy_ret_6m", "high_proximity"
+        "ret_6m", "spy_ret_6m", "high_52w", "high_proximity"
+    ]).to_csv("top_candidates.csv", index=False)
+    pd.DataFrame(columns=[
+        "ticker", "revision_count", "market_cap", "price", "ma200",
+        "ret_6m", "spy_ret_6m", "high_52w", "high_proximity"
     ]).to_csv("multibagger_candidates.csv", index=False)
 
 
 def main():
     today = pd.Timestamp(datetime.date.today())
 
-    # 1) S&P1500 전체 EPS 스냅샷
     tickers = get_sp1500_tickers()
 
     rows = []
@@ -152,13 +152,11 @@ def main():
 
     today_df = pd.DataFrame(rows)
 
-    # 2) 히스토리 누적
     history = load_history()
     history = pd.concat([history[["date", "ticker", "eps"]], today_df], ignore_index=True)
     history = history.drop_duplicates(subset=["date", "ticker"], keep="last")
     history = history.sort_values(["ticker", "date"]).reset_index(drop=True)
 
-    # 3) 전일 대비 EPS 상향 여부
     history["prev_eps"] = history.groupby("ticker")["eps"].shift(1)
     history["up_revision"] = (
         history["eps"].notna()
@@ -169,7 +167,6 @@ def main():
     save_history = history[["date", "ticker", "eps", "up_revision"]].copy()
     save_history.to_csv("eps_history.csv", index=False)
 
-    # 4) 최근 90일 누적 상향 횟수
     cutoff = pd.Timestamp.today().normalize() - pd.Timedelta(days=LOOKBACK_DAYS)
     recent = save_history[save_history["date"] >= cutoff]
 
@@ -189,7 +186,6 @@ def main():
         print("Final candidates: 0")
         return
 
-    # 5) SPY 상대강도 기준
     spy_ret_6m = get_6m_return("SPY")
     time.sleep(REQUEST_SLEEP)
 
@@ -200,7 +196,6 @@ def main():
         print("SPY return fetch failed")
         return
 
-    # 6) 최종 필터 적용
     final_rows = []
 
     for _, row in stage1.iterrows():
@@ -223,7 +218,9 @@ def main():
         if price is None or market_cap is None or ma200 is None or high_52w is None or high_52w == 0:
             continue
 
-        # 공통 필터
+        if market_cap < MIN_MARKET_CAP:
+            continue
+
         if price <= ma200:
             continue
 
@@ -231,6 +228,9 @@ def main():
             continue
 
         high_proximity = price / high_52w
+
+        if high_proximity < MIN_HIGH_PROXIMITY:
+            continue
 
         final_rows.append({
             "ticker": ticker,
@@ -240,6 +240,7 @@ def main():
             "ma200": ma200,
             "ret_6m": ret_6m,
             "spy_ret_6m": spy_ret_6m,
+            "high_52w": high_52w,
             "high_proximity": high_proximity
         })
 
@@ -254,22 +255,19 @@ def main():
         return
 
     final_df = final_df.sort_values(
-        ["revision_count", "ret_6m"],
-        ascending=[False, False]
+        ["revision_count", "ret_6m", "high_proximity"],
+        ascending=[False, False, False]
     ).reset_index(drop=True)
 
-    # 7) 전체 후보
     final_df.to_csv("eps_candidates.csv", index=False)
 
-    # 8) 상위 10개
     top_df = final_df.head(10).copy()
     top_df.to_csv("top_candidates.csv", index=False)
 
-    # 9) 멀티배거 후보
     multi_df = final_df[
         (final_df["market_cap"] >= MIN_MULTIBAGGER_CAP) &
         (final_df["market_cap"] <= MAX_MULTIBAGGER_CAP) &
-        (final_df["high_proximity"] >= MIN_52W_HIGH_PROXIMITY)
+        (final_df["high_proximity"] >= MIN_MULTIBAGGER_HIGH_PROXIMITY)
     ].copy()
 
     multi_df.to_csv("multibagger_candidates.csv", index=False)
