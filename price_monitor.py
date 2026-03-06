@@ -1,7 +1,23 @@
 import requests
 import pandas as pd
 import time
+import os
 
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
+def send_telegram(msg):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": msg
+    }
+
+    requests.post(url, data=payload, timeout=20)
 REQUEST_SLEEP = 0.15
 
 
@@ -124,3 +140,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+send_telegram("EPS Radar system online")
