@@ -3,6 +3,7 @@ import requests
 import pandas as pd
 
 ALERT_TITLE = "AEGIS EPS + MOMENTUM RADAR"
+SECTION_ULTRA = "ULTRA signals (★★★)"
 SECTION_TOP = "Top candidates"
 SECTION_MULTI = "Multibagger candidates (★)"
 EMPTY_TEXT = "none"
@@ -35,6 +36,8 @@ def format_line(row):
     detect_n = row.get("detection_number", None)
     stage = str(row.get("signal_stage", ""))
     action = str(row.get("action", ""))
+    rev_speed_tag = str(row.get("rev_speed_tag", ""))
+    guidance_signal = str(row.get("guidance_signal", ""))
     gtag = str(row.get("growth_accel_tag", ""))
     gproxy = row.get("growth_accel_proxy", None)
     qtag = str(row.get("quality_proxy_tag", ""))
@@ -47,8 +50,17 @@ def format_line(row):
     sector = row.get("sector_etf", "")
     score = row.get("score", None)
     is_multi = row.get("is_multibagger", False)
+    is_ultra = row.get("is_ultra", False)
 
-    prefix = "★ " if str(is_multi).lower() == "true" or is_multi is True else ""
+    ultra_flag = (str(is_ultra).lower() == "true") or (is_ultra is True)
+    multi_flag = (str(is_multi).lower() == "true") or (is_multi is True)
+
+    if ultra_flag:
+        prefix = "★★★ "
+    elif multi_flag:
+        prefix = "★ "
+    else:
+        prefix = ""
 
     parts = [f"{prefix}{ticker}"]
 
@@ -58,6 +70,10 @@ def format_line(row):
         parts.append(stage)
     if action:
         parts.append(action)
+    if rev_speed_tag:
+        parts.append(rev_speed_tag)
+    if guidance_signal:
+        parts.append(f"guide:{guidance_signal}")
     if gtag:
         parts.append(f"g:{gtag}")
     if qtag:
@@ -88,11 +104,21 @@ def main():
     final_df = load_csv_safe("eps_candidates.csv")
     top_df = load_csv_safe("top_candidates.csv")
     multi_df = load_csv_safe("multibagger_candidates.csv")
+    ultra_df = load_csv_safe("ultra_candidates.csv")
     stage1_df = load_csv_safe("eps_stage1_raw.csv")
 
     lines = [ALERT_TITLE, ""]
     lines.append(f"Stage1 raw: {len(stage1_df)}")
     lines.append(f"Final candidates: {len(final_df)}")
+    lines.append("")
+
+    if ultra_df.empty:
+        lines.append(f"{SECTION_ULTRA}: {EMPTY_TEXT}")
+    else:
+        lines.append(f"{SECTION_ULTRA}:")
+        for _, row in ultra_df.head(10).iterrows():
+            lines.append(f"- {format_line(row)}")
+
     lines.append("")
 
     if top_df.empty:
