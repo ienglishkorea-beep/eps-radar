@@ -2,10 +2,7 @@ import os
 import requests
 import pandas as pd
 
-# =========================================
-# ALERT TEXT
-# =========================================
-ALERT_TITLE = "AEGIS EPS Radar"
+ALERT_TITLE = "AEGIS EPS + MOMENTUM RADAR"
 SECTION_TOP = "Top candidates"
 SECTION_MULTI = "Multibagger candidates"
 EMPTY_TEXT = "none"
@@ -19,10 +16,7 @@ def send_telegram(msg):
         return
 
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": msg
-    }
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": msg}
     requests.post(url, data=payload, timeout=20)
 
 
@@ -38,36 +32,49 @@ def load_csv_safe(path):
 
 def format_line(row):
     ticker = str(row.get("ticker", ""))
-    rev = row.get("revision_count", "")
-    rev_g = row.get("revenue_growth", None)
-    ret6 = row.get("ret_6m", None)
+    score = row.get("score", None)
+    rev = row.get("revision_count", None)
+    sales = row.get("revenue_growth", None)
+    price = row.get("price", None)
+    entry = row.get("entry_price", None)
+    stop = row.get("stop_price", None)
     prox = row.get("high_proximity", None)
+    vol = row.get("volume_ratio", None)
+    sector = row.get("sector_etf", "")
 
     parts = [ticker]
 
-    if rev != "":
+    if score is not None and pd.notna(score):
+        parts.append(f"score {float(score):.1f}")
+    if rev is not None and pd.notna(rev):
         parts.append(f"rev {int(rev)}")
-
-    if rev_g is not None and pd.notna(rev_g):
-        parts.append(f"sales {rev_g * 100:.0f}%")
-
-    if ret6 is not None and pd.notna(ret6):
-        parts.append(f"6m {ret6 * 100:.0f}%")
-
+    if sales is not None and pd.notna(sales):
+        parts.append(f"sales {float(sales) * 100:.0f}%")
+    if price is not None and pd.notna(price):
+        parts.append(f"px {float(price):.2f}")
+    if entry is not None and pd.notna(entry):
+        parts.append(f"entry {float(entry):.2f}")
+    if stop is not None and pd.notna(stop):
+        parts.append(f"stop {float(stop):.2f}")
     if prox is not None and pd.notna(prox):
-        parts.append(f"52w {prox * 100:.0f}%")
+        parts.append(f"52w {float(prox) * 100:.0f}%")
+    if vol is not None and pd.notna(vol):
+        parts.append(f"vol {float(vol):.1f}x")
+    if sector:
+        parts.append(f"sec {sector}")
 
     return " | ".join(parts)
 
 
 def main():
-    eps_df = load_csv_safe("eps_candidates.csv")
+    final_df = load_csv_safe("eps_candidates.csv")
     top_df = load_csv_safe("top_candidates.csv")
     multi_df = load_csv_safe("multibagger_candidates.csv")
+    stage1_df = load_csv_safe("eps_stage1_raw.csv")
 
     lines = [ALERT_TITLE, ""]
-
-    lines.append(f"EPS candidates: {len(eps_df)}")
+    lines.append(f"Stage1 raw: {len(stage1_df)}")
+    lines.append(f"Final candidates: {len(final_df)}")
     lines.append("")
 
     if top_df.empty:
@@ -86,8 +93,7 @@ def main():
         for _, row in multi_df.head(10).iterrows():
             lines.append(f"- {format_line(row)}")
 
-    message = "\n".join(lines)
-    send_telegram(message)
+    send_telegram("\n".join(lines))
     print("EPS alert sent.")
 
 
