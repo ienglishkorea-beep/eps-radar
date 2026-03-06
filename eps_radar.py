@@ -9,7 +9,7 @@ USER_AGENT = {"User-Agent": "Mozilla/5.0"}
 
 # =========================================
 # FINAL EPS + MOMENTUM + SECTOR RADAR
-# INITIAL SIGNAL PRIORITY VERSION
+# DETECTION-FIRST VERSION
 # =========================================
 
 # Universe / liquidity
@@ -58,6 +58,11 @@ SECTOR_MAP = {
 
 OUTPUT_COLS = [
     "ticker",
+    "detection_number",
+    "signal_stage",
+    "action",
+    "growth_accel_tag",
+    "growth_accel_proxy",
     "score",
     "revision_count",
     "revenue_growth",
@@ -82,9 +87,6 @@ OUTPUT_COLS = [
 ]
 
 
-# =========================================
-# Helpers
-# =========================================
 def clamp01(x: float) -> float:
     return max(0.0, min(1.0, x))
 
@@ -246,16 +248,29 @@ def get_sector_etf(sector_name):
 
 
 # =========================================
-# Initial-signal scoring
+# Detection / stage / proxy logic
 # =========================================
+def get_signal_stage(revision_count: int) -> str:
+    if revision_count == 2:
+        return "INITIAL"
+    elif revision_count == 3:
+        return "EARLY"
+    elif revision_count == 4:
+        return "MID"
+    else:
+        return "LATE"
+
+
+def get_action(revision_count: int) -> str:
+    if revision_count in [2, 3]:
+        return "BUY"
+    elif revision_count == 4:
+        return "WATCH"
+    else:
+        return "NO_ENTRY"
+
+
 def get_eps_score(revision_count: int) -> float:
-    """
-    Initial signal priority:
-    2 revisions = strongest early signal
-    3 revisions = still very strong
-    4 revisions = later confirmation
-    5+ revisions = already known / later stage
-    """
     if revision_count == 2:
         return 1.00
     elif revision_count == 3:
@@ -267,9 +282,6 @@ def get_eps_score(revision_count: int) -> float:
 
 
 def get_revenue_score(revenue_growth: float) -> float:
-    """
-    Favors real business acceleration proxy.
-    """
     if revenue_growth >= 0.30:
         return 1.00
     elif revenue_growth >= 0.20:
@@ -280,6 +292,67 @@ def get_revenue_score(revenue_growth: float) -> float:
         return 0.30
     else:
         return 0.0
+
+
+def get_breakout_proxy_score(high_proximity: float) -> float:
+    if high_proximity >= 0.95:
+        return 1.0
+    elif high_proximity >= 0.90:
+        return 0.7
+    elif high_proximity >= 0.85:
+        return 0.4
+    else:
+        return 0.0
+
+
+def get_sector_proxy_score(stock_ret_6m, sector_ret_6m, spy_ret_6m) -> float:
+    if sector_ret_6m > spy_ret_6m and stock_ret_6m > sector_ret_6m:
+        return 1.0
+    elif sector_ret_6m > spy_ret_6m:
+        return 0.5
+    else:
+        return 0.0
+
+
+def get_growth_accel_proxy(
+    revision_count: int,
+    revenue_growth: float,
+    high_proximity: float,
+    stock_ret_6m: float,
+    sector_ret_6m: float,
+    spy_ret_6m: float,
+) -> float:
+    eps_part = get_eps_score(revision_count)
+    rev_part = get_revenue_score(revenue_growth)
+    breakout_part = get_breakout_proxy_score(high_proximity)
+    sector_part = get_sector_proxy_score(stock_ret_6m, sector_ret_6m, spy_ret_6m)
+
+    proxy = (
+        0.35 * eps_part +
+        0.35 * rev_part +
+        0.15 * breakout_part +
+        0.15 * sector_part
+    )
+    return round(proxy, 2)
+
+
+def get_growth_accel_tag(
+    revision_count: int,
+    revenue_growth: float,
+    high_proximity: float,
+    stock_ret_6m: float,
+    sector_ret_6m: float,
+    spy_ret_6m: float,
+) -> str:
+    strong_sector = sector_ret_6m > spy_ret_6m
+    strong_stock = stock_ret_6m > sector_ret_6m
+
+    if revision_count in [2, 3] and revenue_growth >= 0.20 and high_proximity >= 0.90 and strong_sector and strong_stock:
+        return "ACCEL"
+    elif revision_count in [2, 3] and revenue_growth >= 0.15:
+        return "EARLY"
+    else:
+        return "NORMAL"
 
 
 def compute_score(
@@ -297,7 +370,6 @@ def compute_score(
     eps_score = get_eps_score(revision_count)
     rev_score = get_revenue_score(revenue_growth)
 
-    # Trend score
     trend_parts = 0.0
     if price > ma50:
         trend_parts += 0.35
@@ -308,19 +380,11 @@ def compute_score(
     trend_parts += 0.30 * clamp01(rs_vs_spy / 0.30)
     trend_score = clamp01(trend_parts)
 
-    # Breakout proximity: 80%=0, 100%=1
     prox_score = clamp01((high_proximity - 0.80) / 0.20)
-
-    # Volume: 1.0x=0, 2.5x=1
     vol_score = clamp01((volume_ratio - 1.0) / 1.5)
-
-    # Strong sector
     sector_score = 1.0 if sector_ret_6m > spy_ret_6m else 0.0
-
-    # Strong stock within strong sector
     stock_sector_score = 1.0 if ret_6m > sector_ret_6m else 0.0
 
-    # Initial-signal priority weights
     score = (
         35 * eps_score +
         25 * rev_score +
@@ -384,7 +448,6 @@ def build_candidates(stage1, spy_ret_6m, sector_returns, min_high_proximity):
         ):
             continue
 
-        # Sector ETF mapping
         sector_etf = get_sector_etf(sector)
         if sector_etf is None:
             continue
@@ -435,6 +498,25 @@ def build_candidates(stage1, spy_ret_6m, sector_returns, min_high_proximity):
         entry_price = max(high_20d * 1.01, price * 1.02)
         stop_price = entry_price * 0.85
 
+        signal_stage = get_signal_stage(revision_count)
+        action = get_action(revision_count)
+        growth_accel_proxy = get_growth_accel_proxy(
+            revision_count=revision_count,
+            revenue_growth=revenue_growth,
+            high_proximity=high_proximity,
+            stock_ret_6m=ret_6m,
+            sector_ret_6m=sector_ret_6m,
+            spy_ret_6m=spy_ret_6m,
+        )
+        growth_accel_tag = get_growth_accel_tag(
+            revision_count=revision_count,
+            revenue_growth=revenue_growth,
+            high_proximity=high_proximity,
+            stock_ret_6m=ret_6m,
+            sector_ret_6m=sector_ret_6m,
+            spy_ret_6m=spy_ret_6m,
+        )
+
         score = compute_score(
             revision_count=revision_count,
             revenue_growth=revenue_growth,
@@ -450,6 +532,11 @@ def build_candidates(stage1, spy_ret_6m, sector_returns, min_high_proximity):
 
         rows.append({
             "ticker": ticker,
+            "detection_number": revision_count,
+            "signal_stage": signal_stage,
+            "action": action,
+            "growth_accel_tag": growth_accel_tag,
+            "growth_accel_proxy": growth_accel_proxy,
             "score": score,
             "revision_count": revision_count,
             "revenue_growth": revenue_growth,
@@ -566,8 +653,8 @@ def main():
 
     # 8) Sort
     final_df = final_df.sort_values(
-        ["score", "revision_count", "ret_6m", "high_proximity"],
-        ascending=[False, False, False, False],
+        ["growth_accel_tag", "action", "score", "revision_count", "ret_6m", "high_proximity"],
+        ascending=[True, True, False, True, False, False],
     ).reset_index(drop=True)
 
     final_df = final_df[OUTPUT_COLS]
@@ -582,6 +669,7 @@ def main():
         & (final_df["revenue_growth"] >= MIN_MULTIBAGGER_REVENUE_GROWTH)
         & (final_df["high_proximity"] >= MIN_MULTIBAGGER_HIGH_PROXIMITY)
         & (final_df["volume_ratio"] >= MIN_MULTIBAGGER_VOLUME_RATIO)
+        & (final_df["action"] != "NO_ENTRY")
     ].copy()
     multi_df.to_csv("multibagger_candidates.csv", index=False)
 
