@@ -4,7 +4,7 @@ import pandas as pd
 
 ALERT_TITLE = "AEGIS EPS + MOMENTUM RADAR"
 SECTION_TOP = "Top candidates"
-SECTION_MULTI = "Multibagger candidates"
+SECTION_MULTI = "Multibagger candidates (★)"
 EMPTY_TEXT = "none"
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -37,6 +37,7 @@ def format_line(row):
     action = str(row.get("action", ""))
     gtag = str(row.get("growth_accel_tag", ""))
     gproxy = row.get("growth_accel_proxy", None)
+    qtag = str(row.get("quality_proxy_tag", ""))
     sales = row.get("revenue_growth", None)
     price = row.get("price", None)
     entry = row.get("entry_price", None)
@@ -45,8 +46,11 @@ def format_line(row):
     vol = row.get("volume_ratio", None)
     sector = row.get("sector_etf", "")
     score = row.get("score", None)
+    is_multi = row.get("is_multibagger", False)
 
-    parts = [ticker]
+    prefix = "★ " if str(is_multi).lower() == "true" or is_multi is True else ""
+
+    parts = [f"{prefix}{ticker}"]
 
     if detect_n is not None and pd.notna(detect_n):
         parts.append(f"#{int(detect_n)}")
@@ -56,6 +60,8 @@ def format_line(row):
         parts.append(action)
     if gtag:
         parts.append(f"g:{gtag}")
+    if qtag:
+        parts.append(f"q:{qtag}")
     if gproxy is not None and pd.notna(gproxy):
         parts.append(f"gp {float(gproxy):.2f}")
     if sales is not None and pd.notna(sales):
