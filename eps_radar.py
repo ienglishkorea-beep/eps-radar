@@ -1,16 +1,30 @@
 import requests
 import pandas as pd
 import datetime
-
+from io import StringIO
 LOOKBACK_DAYS = 90
 REVISION_THRESHOLD = 3
 
 
 def get_sp500_tickers():
-    url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-    tables = pd.read_html(url)
-    return tables[0]["Symbol"].tolist()
 
+    url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+
+    headers = {
+        "User-Agent": "Mozilla/5.0"
+    }
+
+    response = requests.get(url, headers=headers, timeout=20)
+
+    html = response.text
+
+    tables = pd.read_html(StringIO(html))
+
+    tickers = tables[0]["Symbol"].tolist()
+
+    tickers = [ticker.replace(".", "-") for ticker in tickers]
+
+    return tickers
 
 def get_eps_estimate(ticker):
     try:
