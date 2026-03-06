@@ -9,7 +9,7 @@ USER_AGENT = {"User-Agent": "Mozilla/5.0"}
 
 # =========================================
 # FINAL EPS + MOMENTUM + SECTOR RADAR
-# DETECTION-FIRST VERSION
+# DETECTION-FIRST + MULTIBAGGER STAR VERSION
 # =========================================
 
 # Universe / liquidity
@@ -58,14 +58,18 @@ SECTOR_MAP = {
 
 OUTPUT_COLS = [
     "ticker",
+    "is_multibagger",
     "detection_number",
     "signal_stage",
     "action",
     "growth_accel_tag",
     "growth_accel_proxy",
+    "quality_proxy_tag",
     "score",
     "revision_count",
     "revenue_growth",
+    "gross_margin",
+    "operating_margin",
     "price",
     "entry_price",
     "stop_price",
@@ -241,6 +245,39 @@ def get_revenue_growth(ticker: str):
         return None
 
 
+def get_margin_data(ticker: str):
+    """
+    ROIC 직접값 대신 멀티백어 전용 quality proxy로 사용.
+    Yahoo financialData에서 grossMargins / operatingMargins 읽음.
+    """
+    try:
+        url = (
+            f"https://query2.finance.yahoo.com/v10/finance/quoteSummary/"
+            f"{ticker}?modules=financialData"
+        )
+        r = requests.get(url, headers=USER_AGENT, timeout=20)
+        data = r.json()
+
+        result = data.get("quoteSummary", {}).get("result")
+        if not result:
+            return None
+
+        fd = result[0].get("financialData", {})
+
+        gross_margin = fd.get("grossMargins", {})
+        operating_margin = fd.get("operatingMargins", {})
+
+        gross_margin = gross_margin.get("raw") if isinstance(gross_margin, dict) else None
+        operating_margin = operating_margin.get("raw") if isinstance(operating_margin, dict) else None
+
+        return {
+            "gross_margin": float(gross_margin) if gross_margin is not None else None,
+            "operating_margin": float(operating_margin) if operating_margin is not None else None,
+        }
+    except Exception:
+        return None
+
+
 def get_sector_etf(sector_name):
     if not sector_name:
         return None
@@ -355,6 +392,24 @@ def get_growth_accel_tag(
         return "NORMAL"
 
 
+def get_quality_proxy_tag(revenue_growth, gross_margin, operating_margin):
+    """
+    멀티백어 전용 품질 대체 태그.
+    정확한 ROIC 상승 대신:
+    고성장 + 높은 총마진 + 높은 영업마진
+    """
+    if (
+        revenue_growth is not None
+        and gross_margin is not None
+        and operating_margin is not None
+        and revenue_growth >= 0.20
+        and gross_margin >= 0.45
+        and operating_margin >= 0.15
+    ):
+        return "QUALITY"
+    return "NORMAL"
+
+
 def compute_score(
     revision_count,
     revenue_growth,
@@ -420,10 +475,13 @@ def build_candidates(stage1, spy_ret_6m, sector_returns, min_high_proximity):
         revenue_growth = get_revenue_growth(ticker)
         time.sleep(REQUEST_SLEEP)
 
+        margin_data = get_margin_data(ticker)
+        time.sleep(REQUEST_SLEEP)
+
         high_20d = get_20d_high(ticker)
         time.sleep(REQUEST_SLEEP)
 
-        if quote is None or ret_6m is None or revenue_growth is None or high_20d is None:
+        if quote is None or ret_6m is None or revenue_growth is None or margin_data is None or high_20d is None:
             continue
 
         price = quote.get("price")
@@ -434,6 +492,9 @@ def build_candidates(stage1, spy_ret_6m, sector_returns, min_high_proximity):
         volume = quote.get("volume")
         avg_volume_3m = quote.get("avg_volume_3m")
         sector = quote.get("sector")
+
+        gross_margin = margin_data.get("gross_margin")
+        operating_margin = margin_data.get("operating_margin")
 
         if (
             price is None
@@ -500,6 +561,7 @@ def build_candidates(stage1, spy_ret_6m, sector_returns, min_high_proximity):
 
         signal_stage = get_signal_stage(revision_count)
         action = get_action(revision_count)
+
         growth_accel_proxy = get_growth_accel_proxy(
             revision_count=revision_count,
             revenue_growth=revenue_growth,
@@ -508,6 +570,7 @@ def build_candidates(stage1, spy_ret_6m, sector_returns, min_high_proximity):
             sector_ret_6m=sector_ret_6m,
             spy_ret_6m=spy_ret_6m,
         )
+
         growth_accel_tag = get_growth_accel_tag(
             revision_count=revision_count,
             revenue_growth=revenue_growth,
@@ -515,6 +578,12 @@ def build_candidates(stage1, spy_ret_6m, sector_returns, min_high_proximity):
             stock_ret_6m=ret_6m,
             sector_ret_6m=sector_ret_6m,
             spy_ret_6m=spy_ret_6m,
+        )
+
+        quality_proxy_tag = get_quality_proxy_tag(
+            revenue_growth=revenue_growth,
+            gross_margin=gross_margin,
+            operating_margin=operating_margin,
         )
 
         score = compute_score(
@@ -530,16 +599,32 @@ def build_candidates(stage1, spy_ret_6m, sector_returns, min_high_proximity):
             ma200=ma200,
         )
 
+        # Multibagger classification
+        is_multibagger = (
+            (market_cap >= MIN_MULTIBAGGER_CAP)
+            and (market_cap <= MAX_MULTIBAGGER_CAP)
+            and (revenue_growth >= MIN_MULTIBAGGER_REVENUE_GROWTH)
+            and (high_proximity >= MIN_MULTIBAGGER_HIGH_PROXIMITY)
+            and (volume_ratio >= MIN_MULTIBAGGER_VOLUME_RATIO)
+            and (action != "NO_ENTRY")
+            and (growth_accel_tag == "ACCEL")
+            and (quality_proxy_tag == "QUALITY")
+        )
+
         rows.append({
             "ticker": ticker,
+            "is_multibagger": bool(is_multibagger),
             "detection_number": revision_count,
             "signal_stage": signal_stage,
             "action": action,
             "growth_accel_tag": growth_accel_tag,
             "growth_accel_proxy": growth_accel_proxy,
+            "quality_proxy_tag": quality_proxy_tag,
             "score": score,
             "revision_count": revision_count,
             "revenue_growth": revenue_growth,
+            "gross_margin": gross_margin,
+            "operating_margin": operating_margin,
             "price": price,
             "entry_price": round(entry_price, 2),
             "stop_price": round(stop_price, 2),
@@ -652,25 +737,25 @@ def main():
         return
 
     # 8) Sort
+    growth_rank = {"ACCEL": 0, "EARLY": 1, "NORMAL": 2}
+    action_rank = {"BUY": 0, "WATCH": 1, "NO_ENTRY": 2}
+
+    final_df["growth_sort"] = final_df["growth_accel_tag"].map(growth_rank).fillna(9)
+    final_df["action_sort"] = final_df["action"].map(action_rank).fillna(9)
+
     final_df = final_df.sort_values(
-        ["growth_accel_tag", "action", "score", "revision_count", "ret_6m", "high_proximity"],
+        ["growth_sort", "action_sort", "score", "revision_count", "ret_6m", "high_proximity"],
         ascending=[True, True, False, True, False, False],
     ).reset_index(drop=True)
 
+    final_df = final_df.drop(columns=["growth_sort", "action_sort"])
     final_df = final_df[OUTPUT_COLS]
     final_df.to_csv("eps_candidates.csv", index=False)
 
     top_df = final_df.head(10).copy()
     top_df.to_csv("top_candidates.csv", index=False)
 
-    multi_df = final_df[
-        (final_df["market_cap"] >= MIN_MULTIBAGGER_CAP)
-        & (final_df["market_cap"] <= MAX_MULTIBAGGER_CAP)
-        & (final_df["revenue_growth"] >= MIN_MULTIBAGGER_REVENUE_GROWTH)
-        & (final_df["high_proximity"] >= MIN_MULTIBAGGER_HIGH_PROXIMITY)
-        & (final_df["volume_ratio"] >= MIN_MULTIBAGGER_VOLUME_RATIO)
-        & (final_df["action"] != "NO_ENTRY")
-    ].copy()
+    multi_df = final_df[final_df["is_multibagger"] == True].copy()
     multi_df.to_csv("multibagger_candidates.csv", index=False)
 
     print("Done.")
