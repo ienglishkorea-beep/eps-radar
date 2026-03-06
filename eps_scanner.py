@@ -32,8 +32,11 @@ def load_csv_safe(path):
 
 def format_line(row):
     ticker = str(row.get("ticker", ""))
-    score = row.get("score", None)
-    rev = row.get("revision_count", None)
+    detect_n = row.get("detection_number", None)
+    stage = str(row.get("signal_stage", ""))
+    action = str(row.get("action", ""))
+    gtag = str(row.get("growth_accel_tag", ""))
+    gproxy = row.get("growth_accel_proxy", None)
     sales = row.get("revenue_growth", None)
     price = row.get("price", None)
     entry = row.get("entry_price", None)
@@ -41,13 +44,20 @@ def format_line(row):
     prox = row.get("high_proximity", None)
     vol = row.get("volume_ratio", None)
     sector = row.get("sector_etf", "")
+    score = row.get("score", None)
 
     parts = [ticker]
 
-    if score is not None and pd.notna(score):
-        parts.append(f"score {float(score):.1f}")
-    if rev is not None and pd.notna(rev):
-        parts.append(f"rev {int(rev)}")
+    if detect_n is not None and pd.notna(detect_n):
+        parts.append(f"#{int(detect_n)}")
+    if stage:
+        parts.append(stage)
+    if action:
+        parts.append(action)
+    if gtag:
+        parts.append(f"g:{gtag}")
+    if gproxy is not None and pd.notna(gproxy):
+        parts.append(f"gp {float(gproxy):.2f}")
     if sales is not None and pd.notna(sales):
         parts.append(f"sales {float(sales) * 100:.0f}%")
     if price is not None and pd.notna(price):
@@ -62,6 +72,8 @@ def format_line(row):
         parts.append(f"vol {float(vol):.1f}x")
     if sector:
         parts.append(f"sec {sector}")
+    if score is not None and pd.notna(score):
+        parts.append(f"score {float(score):.1f}")
 
     return " | ".join(parts)
 
