@@ -2,86 +2,114 @@ import requests
 import pandas as pd
 import datetime
 from io import StringIO
+
 LOOKBACK_DAYS = 90
 REVISION_THRESHOLD = 3
 
 
 def get_sp500_tickers():
-
     url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-
-    headers = {
-        "User-Agent": "Mozilla/5.0"
-    }
+    headers = {"User-Agent": "Mozilla/5.0"}
 
     response = requests.get(url, headers=headers, timeout=20)
-
     html = response.text
 
     tables = pd.read_html(StringIO(html))
-
     tickers = tables[0]["Symbol"].tolist()
-
     tickers = [ticker.replace(".", "-") for ticker in tickers]
 
     return tickers
 
+
 def get_eps_estimate(ticker):
     try:
         url = f"https://query2.finance.yahoo.com/v10/finance/quoteSummary/{ticker}?modules=earningsTrend"
-        r = requests.get(url)
+        headers = {"User-Agent": "Mozilla/5.0"}
+        r = requests.get(url, headers=headers, timeout=20)
         data = r.json()
 
         trends = data["quoteSummary"]["result"][0]["earningsTrend"]["trend"]
 
-        revisions = 0
-        eps_values = []
-
+        # +1y 추정치를 우선 사용
         for t in trends:
-            if "earningsEstimate" in t:
-                est = t["earningsEstimate"].get("avg", {}).get("raw")
-                if est:
-                    eps_values.append(est)
+            if t.get("period") == "+1y":
+                current = t.get("epsTrend", {}).get("current", {}).get("raw")
+                if current is not None:
+                    return current
 
-        if len(eps_values) >= 2:
-            for i in range(1, len(eps_values)):
-                if eps_values[i] > eps_values[i-1]:
-                    revisions += 1
+        return None
 
-        return revisions
+    except Exception:
+        return None
 
-    except:
-        return 0
+
+def load_history():
+    try:
+        df = pd.read_csv("eps_history.csv")
+        df["date"] = pd.to_datetime(df["date"])
+        return df
+    except Exception:
+        return pd.DataFrame(columns=["date", "ticker", "eps", "up_revision"])
 
 
 def main():
-
     tickers = get_sp500_tickers()
+    today = pd.Timestamp(datetime.date.today())
 
-    results = []
-
+    # 오늘 스냅샷 수집
+    rows = []
     for ticker in tickers:
+        eps = get_eps_estimate(ticker)
+        rows.append({
+            "date": today,
+            "ticker": ticker,
+            "eps": eps
+        })
 
-        revisions = get_eps_estimate(ticker)
+    today_df = pd.DataFrame(rows)
 
-        if revisions >= REVISION_THRESHOLD:
+    # 기존 히스토리 불러오기
+    history = load_history()
 
-            results.append({
-                "ticker": ticker,
-                "revisions": revisions,
-                "date": datetime.date.today()
-            })
+    # 오늘 데이터 추가
+    history = pd.concat([history[["date", "ticker", "eps"]], today_df], ignore_index=True)
 
-    df = pd.DataFrame(results)
+    # 같은 날짜/티커 중복 제거
+    history = history.drop_duplicates(subset=["date", "ticker"], keep="last")
 
-    df.to_csv("eps_candidates.csv", index=False)
+    # 정렬
+    history = history.sort_values(["ticker", "date"]).reset_index(drop=True)
 
-    history = pd.read_csv("eps_history.csv") if \
-        requests.get("https://raw.githubusercontent.com").status_code else pd.DataFrame()
+    # 전일 대비 EPS 상향 여부 계산
+    history["prev_eps"] = history.groupby("ticker")["eps"].shift(1)
+    history["up_revision"] = (
+        history["eps"].notna()
+        & history["prev_eps"].notna()
+        & (history["eps"] > history["prev_eps"])
+    ).astype(int)
 
-    history = pd.concat([history, df])
+    # 저장용 history
+    save_history = history[["date", "ticker", "eps", "up_revision"]].copy()
+    save_history.to_csv("eps_history.csv", index=False)
 
-    history.to_csv("eps_history.csv", index=False)
+    # 최근 LOOKBACK_DAYS 내 상향 횟수 계산
+    cutoff = pd.Timestamp.today().normalize() - pd.Timedelta(days=LOOKBACK_DAYS)
+    recent = save_history[save_history["date"] >= cutoff]
+
+    summary = (
+        recent.groupby("ticker", as_index=False)["up_revision"]
+        .sum()
+        .rename(columns={"up_revision": "revision_count"})
+    )
+
+    candidates = summary[summary["revision_count"] >= REVISION_THRESHOLD].copy()
+    candidates = candidates.sort_values(["revision_count", "ticker"], ascending=[False, True])
+
+    candidates.to_csv("eps_candidates.csv", index=False)
+
+    print("Done.")
+    print(f"Tickers processed: {len(tickers)}")
+    print(f"Candidates found: {len(candidates)}")
 
 
 if __name__ == "__main__":
