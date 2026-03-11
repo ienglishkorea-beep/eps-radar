@@ -10,7 +10,7 @@ import yfinance as yf
 USER_AGENT = {"User-Agent": "Mozilla/5.0"}
 
 # =========================================================
-# EPS RADAR v2
+# EPS RADAR v2.1
 # ---------------------------------------------------------
 # 철학
 # - EPS revision 기반 기업 변화 탐지
@@ -20,12 +20,14 @@ USER_AGENT = {"User-Agent": "Mozilla/5.0"}
 # 핵심 축
 # 1) EPS revision count
 # 2) EPS revision speed
-# 3) RS acceleration (3M / 6M)
-# 4) Supply dry-up
-# 5) Industry leadership
-# 6) Entry quality
-# 7) RS line high
-# 8) Tight structure / VCP readiness
+# 3) EPS revision magnitude
+# 4) EPS revision consistency
+# 5) RS acceleration (3M / 6M)
+# 6) Supply dry-up
+# 7) Industry leadership
+# 8) Entry quality
+# 9) RS line high
+# 10) Tight structure / VCP readiness
 #
 # 출력 등급
 # - ULTRA
@@ -51,6 +53,16 @@ REVISION_THRESHOLD = 2
 REV_SPEED_LOOKBACK_DAYS = 30
 REV_SPEED_THRESHOLD = 2
 
+# revision magnitude
+REV_MAG_WEAK = 0.01
+REV_MAG_MEANINGFUL = 0.03
+REV_MAG_STRONG = 0.05
+REV_MAG_VERY_STRONG = 0.10
+
+# revision consistency
+REV_CONSISTENCY_STRONG = 0.70
+REV_CONSISTENCY_VERY_STRONG = 0.85
+
 # -----------------------------
 # Growth / trend
 # -----------------------------
@@ -71,9 +83,9 @@ QUALITY_OPERATING_MARGIN = 0.15
 # -----------------------------
 # Structure / supply
 # -----------------------------
-SUPPLY_DRYUP_VOL_RATIO_MAX = 0.85           # vol_5d / vol_20d
-SUPPLY_DRYUP_RANGE_RATIO_MAX = 0.85         # range_10d / range_30d
-TIGHT_RANGE_10D_MAX = 0.08                  # (10d high-low) / 10d high
+SUPPLY_DRYUP_VOL_RATIO_MAX = 0.85
+SUPPLY_DRYUP_RANGE_RATIO_MAX = 0.85
+TIGHT_RANGE_10D_MAX = 0.08
 STRICT_TIGHT_RANGE_10D_MAX = 0.06
 MAX_EXTENSION_FROM_MA50 = 0.25
 VCP_BASE_LOOKBACK = 60
@@ -83,7 +95,7 @@ VCP_MAX_BASE_DEPTH = 0.30
 # Industry leadership
 # -----------------------------
 MIN_INDUSTRY_SIZE = 3
-TOP_INDUSTRY_RANK_RATIO = 0.20              # 상위 20%
+TOP_INDUSTRY_RANK_RATIO = 0.20
 
 # -----------------------------
 # Runtime
@@ -119,6 +131,11 @@ OUTPUT_COLS = [
     "revision_count",
     "rev_speed_count_30d",
     "rev_speed_tag",
+    "rev_magnitude_sum_90d",
+    "rev_magnitude_max_90d",
+    "rev_magnitude_tag",
+    "revision_consistency",
+    "revision_consistency_tag",
     "growth_accel_tag",
     "growth_accel_proxy",
     "quality_proxy_tag",
@@ -272,7 +289,6 @@ def get_quote_info(ticker: str) -> Optional[dict]:
 def get_eps_estimate_from_summary(summary: dict) -> Optional[float]:
     try:
         trends = summary.get("earningsTrend", {}).get("trend", [])
-        # +1y 우선, 없으면 0y
         for target_period in ["+1y", "0y"]:
             for trend in trends:
                 if trend.get("period") == target_period:
@@ -570,11 +586,21 @@ def load_history() -> pd.DataFrame:
         df["date"] = pd.to_datetime(df["date"])
         return df
     except Exception:
-        return pd.DataFrame(columns=["date", "ticker", "eps", "up_revision"])
+        return pd.DataFrame(
+            columns=[
+                "date",
+                "ticker",
+                "eps",
+                "prev_eps",
+                "revision_pct",
+                "up_revision",
+                "down_revision",
+            ]
+        )
 
 
 # =========================================================
-# Scoring / tags
+# Revision scoring / tags
 # =========================================================
 
 
@@ -600,6 +626,61 @@ def get_rev_speed_tag(rev_speed_count_30d: int) -> str:
     if rev_speed_count_30d >= REV_SPEED_THRESHOLD:
         return "REV_ACCEL"
     return "NORMAL"
+
+
+def get_revision_magnitude_tag(
+    rev_magnitude_sum_90d: float,
+    rev_magnitude_max_90d: float,
+) -> str:
+    if rev_magnitude_sum_90d >= REV_MAG_VERY_STRONG or rev_magnitude_max_90d >= REV_MAG_VERY_STRONG:
+        return "VERY_STRONG"
+    if rev_magnitude_sum_90d >= REV_MAG_STRONG or rev_magnitude_max_90d >= REV_MAG_STRONG:
+        return "STRONG"
+    if rev_magnitude_sum_90d >= REV_MAG_MEANINGFUL or rev_magnitude_max_90d >= REV_MAG_MEANINGFUL:
+        return "MEANINGFUL"
+    if rev_magnitude_sum_90d >= REV_MAG_WEAK or rev_magnitude_max_90d >= REV_MAG_WEAK:
+        return "WEAK"
+    return "NONE"
+
+
+def get_revision_consistency_tag(revision_consistency: float) -> str:
+    if revision_consistency >= REV_CONSISTENCY_VERY_STRONG:
+        return "VERY_STRONG"
+    if revision_consistency >= REV_CONSISTENCY_STRONG:
+        return "STRONG"
+    if revision_consistency >= 0.50:
+        return "MIXED"
+    return "WEAK"
+
+
+def get_revision_magnitude_score(
+    rev_magnitude_sum_90d: float,
+    rev_magnitude_max_90d: float,
+) -> float:
+    if rev_magnitude_sum_90d >= REV_MAG_VERY_STRONG or rev_magnitude_max_90d >= REV_MAG_VERY_STRONG:
+        return 1.00
+    if rev_magnitude_sum_90d >= REV_MAG_STRONG or rev_magnitude_max_90d >= REV_MAG_STRONG:
+        return 0.75
+    if rev_magnitude_sum_90d >= REV_MAG_MEANINGFUL or rev_magnitude_max_90d >= REV_MAG_MEANINGFUL:
+        return 0.50
+    if rev_magnitude_sum_90d >= REV_MAG_WEAK or rev_magnitude_max_90d >= REV_MAG_WEAK:
+        return 0.25
+    return 0.00
+
+
+def get_revision_consistency_score(revision_consistency: float) -> float:
+    if revision_consistency >= REV_CONSISTENCY_VERY_STRONG:
+        return 1.00
+    if revision_consistency >= REV_CONSISTENCY_STRONG:
+        return 0.60
+    if revision_consistency >= 0.50:
+        return 0.25
+    return 0.00
+
+
+# =========================================================
+# Growth / quality / score
+# =========================================================
 
 
 def get_growth_accel_proxy(
@@ -677,6 +758,9 @@ def get_quality_proxy_tag(
 def classify_grade(
     revision_count: int,
     rev_speed_count_30d: int,
+    rev_magnitude_sum_90d: float,
+    rev_magnitude_max_90d: float,
+    revision_consistency: float,
     growth_accel_tag: str,
     quality_proxy_tag: str,
     high_proximity: float,
@@ -689,9 +773,14 @@ def classify_grade(
     entry_quality_tag: str,
     industry_top: bool,
 ) -> str:
+    mag_tag = get_revision_magnitude_tag(rev_magnitude_sum_90d, rev_magnitude_max_90d)
+    consistency_tag = get_revision_consistency_tag(revision_consistency)
+
     if (
         revision_count in [2, 3]
         and rev_speed_count_30d >= 1
+        and mag_tag in ["STRONG", "VERY_STRONG"]
+        and consistency_tag in ["STRONG", "VERY_STRONG"]
         and growth_accel_tag == "ACCEL"
         and quality_proxy_tag == "QUALITY"
         and high_proximity >= 0.85
@@ -708,6 +797,8 @@ def classify_grade(
 
     if (
         revision_count >= 2
+        and mag_tag in ["MEANINGFUL", "STRONG", "VERY_STRONG"]
+        and consistency_tag in ["MIXED", "STRONG", "VERY_STRONG"]
         and growth_accel_tag in ["ACCEL", "EARLY"]
         and revenue_growth >= 0.15
         and entry_quality_tag in ["READY", "SETUP"]
@@ -719,6 +810,10 @@ def classify_grade(
 
 def compute_score(
     revision_count: int,
+    rev_speed_tag: str,
+    rev_magnitude_sum_90d: float,
+    rev_magnitude_max_90d: float,
+    revision_consistency: float,
     revenue_growth: float,
     ret_6m: float,
     sector_ret_6m: float,
@@ -731,7 +826,6 @@ def compute_score(
     price: float,
     ma50: float,
     ma200: float,
-    rev_speed_tag: str,
     rs_line_high: bool,
     supply_dryup: bool,
     tight_structure: bool,
@@ -767,6 +861,9 @@ def compute_score(
     prox_score = clamp01((high_proximity - 0.80) / 0.20)
     vol_score = clamp01((volume_ratio - 1.0) / 1.5)
     rev_speed_bonus = 1.0 if rev_speed_tag == "REV_ACCEL" else 0.0
+    magnitude_score = get_revision_magnitude_score(rev_magnitude_sum_90d, rev_magnitude_max_90d)
+    consistency_score = get_revision_consistency_score(revision_consistency)
+
     structure_score = 0.0
     if supply_dryup:
         structure_score += 0.30
@@ -779,13 +876,15 @@ def compute_score(
     structure_score = clamp01(structure_score)
 
     score = (
-        24 * eps_score
-        + 18 * rev_score
-        + 20 * trend_score
+        20 * eps_score
+        + 16 * rev_score
+        + 18 * trend_score
+        + 10 * magnitude_score
+        + 6 * consistency_score
+        + 6 * rev_speed_bonus
         + 8 * prox_score
         + 4 * vol_score
-        + 6 * rev_speed_bonus
-        + 20 * structure_score
+        + 12 * structure_score
     )
     return round(score, 2)
 
@@ -811,6 +910,9 @@ def build_candidate_row(
     ticker: str,
     revision_count: int,
     rev_speed_count_30d: int,
+    rev_magnitude_sum_90d: float,
+    rev_magnitude_max_90d: float,
+    revision_consistency: float,
     spy_df: pd.DataFrame,
     spy_ret_6m: float,
     spy_ret_3m: float,
@@ -926,6 +1028,8 @@ def build_candidate_row(
     signal_stage = get_signal_stage(revision_count)
     action = get_action(revision_count)
     rev_speed_tag = get_rev_speed_tag(rev_speed_count_30d)
+    rev_magnitude_tag = get_revision_magnitude_tag(rev_magnitude_sum_90d, rev_magnitude_max_90d)
+    revision_consistency_tag = get_revision_consistency_tag(revision_consistency)
 
     growth_accel_proxy = get_growth_accel_proxy(
         revision_count=revision_count,
@@ -967,17 +1071,22 @@ def build_candidate_row(
 
     row = {
         "ticker": ticker,
-        "grade": "WATCH",  # 후처리에서 최종 확정
+        "grade": "WATCH",
         "multibagger_potential": multibagger_potential,
         "signal_stage": signal_stage,
         "action": action,
         "revision_count": revision_count,
         "rev_speed_count_30d": rev_speed_count_30d,
         "rev_speed_tag": rev_speed_tag,
+        "rev_magnitude_sum_90d": rev_magnitude_sum_90d,
+        "rev_magnitude_max_90d": rev_magnitude_max_90d,
+        "rev_magnitude_tag": rev_magnitude_tag,
+        "revision_consistency": revision_consistency,
+        "revision_consistency_tag": revision_consistency_tag,
         "growth_accel_tag": growth_accel_tag,
         "growth_accel_proxy": growth_accel_proxy,
         "quality_proxy_tag": quality_proxy_tag,
-        "score": None,  # 후처리
+        "score": None,
         "revenue_growth": revenue_growth,
         "gross_margin": gross_margin,
         "operating_margin": operating_margin,
@@ -1028,14 +1137,13 @@ def enrich_with_industry_and_grade(final_df: pd.DataFrame) -> pd.DataFrame:
     if final_df.empty:
         return final_df
 
-    # Industry stats
     industry_stats = (
         final_df.groupby("industry", dropna=False)
         .agg(
             industry_avg_ret_6m=("ret_6m", "mean"),
             industry_avg_ret_3m=("ret_3m", "mean"),
             industry_size=("ticker", "count"),
-            industry_breadth_pct=("price", lambda s: 0.0),  # placeholder, below
+            industry_breadth_pct=("price", lambda s: 0.0),
         )
         .reset_index()
     )
@@ -1067,7 +1175,6 @@ def enrich_with_industry_and_grade(final_df: pd.DataFrame) -> pd.DataFrame:
 
     final_df = final_df.merge(industry_stats, on="industry", how="left", suffixes=("", "_y"))
 
-    # Grade + score
     grades = []
     scores = []
     for _, row in final_df.iterrows():
@@ -1081,6 +1188,9 @@ def enrich_with_industry_and_grade(final_df: pd.DataFrame) -> pd.DataFrame:
         grade = classify_grade(
             revision_count=int(row["revision_count"]),
             rev_speed_count_30d=int(row["rev_speed_count_30d"]),
+            rev_magnitude_sum_90d=float(row["rev_magnitude_sum_90d"]),
+            rev_magnitude_max_90d=float(row["rev_magnitude_max_90d"]),
+            revision_consistency=float(row["revision_consistency"]),
             growth_accel_tag=str(row["growth_accel_tag"]),
             quality_proxy_tag=str(row["quality_proxy_tag"]),
             high_proximity=float(row["high_proximity"]),
@@ -1097,6 +1207,10 @@ def enrich_with_industry_and_grade(final_df: pd.DataFrame) -> pd.DataFrame:
 
         score = compute_score(
             revision_count=int(row["revision_count"]),
+            rev_speed_tag=str(row["rev_speed_tag"]),
+            rev_magnitude_sum_90d=float(row["rev_magnitude_sum_90d"]),
+            rev_magnitude_max_90d=float(row["rev_magnitude_max_90d"]),
+            revision_consistency=float(row["revision_consistency"]),
             revenue_growth=float(row["revenue_growth"]),
             ret_6m=float(row["ret_6m"]),
             sector_ret_6m=float(row["sector_ret_6m"]),
@@ -1109,7 +1223,6 @@ def enrich_with_industry_and_grade(final_df: pd.DataFrame) -> pd.DataFrame:
             price=float(row["price"]),
             ma50=float(row["ma50"]),
             ma200=float(row["ma200"]),
-            rev_speed_tag=str(row["rev_speed_tag"]),
             rs_line_high=bool(row["rs_line_high"]),
             supply_dryup=bool(row["supply_dryup"]),
             tight_structure=bool(row["tight_structure"]),
@@ -1121,7 +1234,6 @@ def enrich_with_industry_and_grade(final_df: pd.DataFrame) -> pd.DataFrame:
     final_df["grade"] = grades
     final_df["score"] = scores
 
-    # sort
     grade_rank = {"ULTRA": 0, "STRONG": 1, "WATCH": 2}
     growth_rank = {"ACCEL": 0, "EARLY": 1, "NORMAL": 2}
     action_rank = {"BUY": 0, "WATCH": 1, "NO_ENTRY": 2}
@@ -1170,6 +1282,11 @@ def print_preview(df: pd.DataFrame) -> None:
         "multibagger_potential",
         "revision_count",
         "rev_speed_count_30d",
+        "rev_magnitude_sum_90d",
+        "rev_magnitude_max_90d",
+        "rev_magnitude_tag",
+        "revision_consistency",
+        "revision_consistency_tag",
         "growth_accel_tag",
         "quality_proxy_tag",
         "score",
@@ -1199,10 +1316,8 @@ def print_preview(df: pd.DataFrame) -> None:
 def main() -> None:
     today = now_ts()
 
-    # Universe
     tickers = get_sp1500_tickers()
 
-    # Daily EPS snapshot
     rows = []
     for ticker in tickers:
         summary = get_quote_summary_modules(ticker)
@@ -1218,32 +1333,52 @@ def main() -> None:
 
     today_df = pd.DataFrame(rows)
 
-    # History update
     history = load_history()
     history = pd.concat([history[["date", "ticker", "eps"]], today_df], ignore_index=True)
     history = history.drop_duplicates(subset=["date", "ticker"], keep="last")
     history = history.sort_values(["ticker", "date"]).reset_index(drop=True)
 
     history["prev_eps"] = history.groupby("ticker")["eps"].shift(1)
+    history["revision_pct"] = history.apply(
+        lambda row: pct_change(row["prev_eps"], row["eps"])
+        if pd.notna(row["prev_eps"]) and pd.notna(row["eps"]) and row["prev_eps"] not in [0, None]
+        else None,
+        axis=1,
+    )
     history["up_revision"] = (
-        history["eps"].notna()
-        & history["prev_eps"].notna()
-        & (history["eps"] > history["prev_eps"])
+        history["revision_pct"].notna()
+        & (history["revision_pct"] > 0)
+    ).astype(int)
+    history["down_revision"] = (
+        history["revision_pct"].notna()
+        & (history["revision_pct"] < 0)
     ).astype(int)
 
-    save_history = history[["date", "ticker", "eps", "up_revision"]].copy()
+    save_history = history[["date", "ticker", "eps", "prev_eps", "revision_pct", "up_revision", "down_revision"]].copy()
     save_history.to_csv("eps_history.csv", index=False)
 
     cutoff_90 = pd.Timestamp.today().normalize() - pd.Timedelta(days=LOOKBACK_DAYS)
-    recent_90 = save_history[save_history["date"] >= cutoff_90]
+    recent_90 = save_history[save_history["date"] >= cutoff_90].copy()
 
-    summary_90 = (
-        recent_90.groupby("ticker", as_index=False)["up_revision"]
-        .sum()
-        .rename(columns={"up_revision": "revision_count"})
+    revision_summary_90 = (
+        recent_90.groupby("ticker", as_index=False)
+        .agg(
+            revision_count=("up_revision", "sum"),
+            total_revision_events=("revision_pct", lambda s: int(pd.Series(s).notna().sum())),
+            down_revision_count=("down_revision", "sum"),
+            rev_magnitude_sum_90d=("revision_pct", lambda s: float(pd.Series(s)[pd.Series(s) > 0].sum()) if len(pd.Series(s)[pd.Series(s) > 0]) > 0 else 0.0),
+            rev_magnitude_max_90d=("revision_pct", lambda s: float(pd.Series(s)[pd.Series(s) > 0].max()) if len(pd.Series(s)[pd.Series(s) > 0]) > 0 else 0.0),
+        )
     )
 
-    stage1 = summary_90[summary_90["revision_count"] >= REVISION_THRESHOLD].copy()
+    revision_summary_90["revision_consistency"] = revision_summary_90.apply(
+        lambda row: float(row["revision_count"] / row["total_revision_events"])
+        if row["total_revision_events"] and row["total_revision_events"] > 0
+        else 0.0,
+        axis=1,
+    )
+
+    stage1 = revision_summary_90[revision_summary_90["revision_count"] >= REVISION_THRESHOLD].copy()
     stage1.to_csv("eps_stage1_raw.csv", index=False)
 
     cutoff_30 = pd.Timestamp.today().normalize() - pd.Timedelta(days=REV_SPEED_LOOKBACK_DAYS)
@@ -1268,7 +1403,6 @@ def main() -> None:
         print("No EPS revision candidates today.")
         return
 
-    # Benchmark / sector returns
     spy_df = download_price_history("SPY", period="1y")
     spy_ret_6m = compute_return_from_history(spy_df, 126)
     spy_ret_3m = compute_return_from_history(spy_df, 63)
@@ -1282,17 +1416,22 @@ def main() -> None:
     sector_etfs = sorted(set(SECTOR_MAP.values()))
     sector_returns = compute_sector_returns_cached(sector_etfs)
 
-    # Build candidates
     candidate_rows: List[dict] = []
     for _, row in stage1.iterrows():
         ticker = str(row["ticker"]).upper().strip()
         revision_count = int(row["revision_count"])
         rev_speed_count_30d = int(rev_speed_map.get(ticker, 0))
+        rev_magnitude_sum_90d = float(row.get("rev_magnitude_sum_90d", 0.0))
+        rev_magnitude_max_90d = float(row.get("rev_magnitude_max_90d", 0.0))
+        revision_consistency = float(row.get("revision_consistency", 0.0))
 
         built = build_candidate_row(
             ticker=ticker,
             revision_count=revision_count,
             rev_speed_count_30d=rev_speed_count_30d,
+            rev_magnitude_sum_90d=rev_magnitude_sum_90d,
+            rev_magnitude_max_90d=rev_magnitude_max_90d,
+            revision_consistency=revision_consistency,
             spy_df=spy_df,
             spy_ret_6m=spy_ret_6m,
             spy_ret_3m=spy_ret_3m,
@@ -1304,18 +1443,23 @@ def main() -> None:
 
     final_df = pd.DataFrame(candidate_rows)
 
-    # relax if too few
     if len(final_df) < AUTO_RELAX_IF_FINAL_LT:
         candidate_rows_relaxed: List[dict] = []
         for _, row in stage1.iterrows():
             ticker = str(row["ticker"]).upper().strip()
             revision_count = int(row["revision_count"])
             rev_speed_count_30d = int(rev_speed_map.get(ticker, 0))
+            rev_magnitude_sum_90d = float(row.get("rev_magnitude_sum_90d", 0.0))
+            rev_magnitude_max_90d = float(row.get("rev_magnitude_max_90d", 0.0))
+            revision_consistency = float(row.get("revision_consistency", 0.0))
 
             built = build_candidate_row(
                 ticker=ticker,
                 revision_count=revision_count,
                 rev_speed_count_30d=rev_speed_count_30d,
+                rev_magnitude_sum_90d=rev_magnitude_sum_90d,
+                rev_magnitude_max_90d=rev_magnitude_max_90d,
+                revision_consistency=revision_consistency,
                 spy_df=spy_df,
                 spy_ret_6m=spy_ret_6m,
                 spy_ret_3m=spy_ret_3m,
@@ -1338,7 +1482,6 @@ def main() -> None:
 
     final_df = enrich_with_industry_and_grade(final_df)
 
-    # outputs
     final_df = final_df[OUTPUT_COLS]
     top_df = final_df.head(10).copy()
     ultra_df = final_df[final_df["grade"] == "ULTRA"].copy()
@@ -1347,7 +1490,6 @@ def main() -> None:
     top_df.to_csv("top_candidates.csv", index=False)
     ultra_df.to_csv("ultra_candidates.csv", index=False)
 
-    # logs
     print("Done.")
     print(f"Tickers processed: {len(tickers)}")
     print(f"Stage1 raw: {len(stage1)}")
