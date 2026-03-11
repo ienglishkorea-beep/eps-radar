@@ -1,0 +1,35 @@
+name: EPS Radar Test Mode
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install pandas
+
+      - name: Run EPS Radar Test Mode
+        run: |
+          python eps_radar_test_mode_v1.py
+
+      - name: Upload test outputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: eps-radar-test-output
+          path: |
+            eps_candidates_test.csv
+            top_candidates_test.csv
+            multibagger_candidates_test.csv
+            ultra_candidates_test.csv
