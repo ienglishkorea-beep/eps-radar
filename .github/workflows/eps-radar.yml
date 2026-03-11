@@ -1,12 +1,12 @@
-name: EPS Radar
+name: run-eps-radar
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 22 * * 1-5"
+    - cron: "30 22 * * 1-5"
 
 jobs:
-  run-eps-radar:
+  run:
     runs-on: ubuntu-latest
 
     steps:
@@ -20,15 +20,15 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install pandas requests yfinance lxml
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install pandas numpy requests yfinance openpyxl
+          fi
 
       - name: Run EPS Radar Engine
-        run: |
-          python eps_radar.py
-
-      - name: Send Telegram Alert
         env:
-          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: |
-          python send_eps_alert.py
+        run: python eps_radar.py
