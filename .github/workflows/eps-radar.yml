@@ -21,13 +21,66 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then
-            pip install -r requirements.txt
-          fi
           pip install pandas numpy requests yfinance openpyxl lxml
 
       - name: Run EPS Radar Engine
+        id: eps_run
+        continue-on-error: true
+        run: |
+          python eps_radar.py > eps_radar_run.log 2>&1
+          echo "exit_code=$?" >> $GITHUB_OUTPUT
+          cat eps_radar_run.log
+
+      - name: Send EPS Daily Telegram Summary
+        if: always()
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python eps_radar.py
+        run: |
+          python - <<'PY'
+          import os
+          import requests
+
+          token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+          chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+
+          if not token or not chat_id:
+              raise RuntimeError("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID")
+
+          try:
+              with open("eps_radar_run.log", "r", encoding="utf-8", errors="ignore") as f:
+                  log_text = f.read().strip()
+          except FileNotFoundError:
+              log_text = "eps_radar_run.log not found"
+
+          if not log_text:
+              log_text = "No EPS Radar output captured."
+
+          lines = [line.rstrip() for line in log_text.splitlines() if line.strip()]
+          tail = "\n".join(lines[-20:]) if lines else "No output"
+
+          msg = (
+              "EPS Radar Daily Summary\n\n"
+              f"{tail}"
+          )
+
+          url = f"https://api.telegram.org/bot{token}/sendMessage"
+          resp = requests.post(
+              url,
+              data={
+                  "chat_id": chat_id,
+                  "text": msg[:4000],
+                  "disable_web_page_preview": True,
+              },
+              timeout=30,
+          )
+
+          if resp.status_code != 200:
+              raise RuntimeError(f"Telegram send failed: {resp.status_code} {resp.text}")
+          PY
+
+      - name: Fail job if EPS Radar failed
+        if: steps.eps_run.outputs.exit_code != '0'
+        run: |
+          echo "EPS Radar failed. See eps_radar_run.log above."
+          exit 1
