@@ -3,12 +3,14 @@ name: Fundamental Direction Radar
 on:
   workflow_dispatch:
   schedule:
+    # 한국시간 평일 오전 8:10
+    # UTC 기준 전일 23:10
     - cron: "10 23 * * 0-4"
 
 jobs:
   run-radar:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
 
     env:
       TIINGO_API_KEY: ${{ secrets.TIINGO_API_KEY }}
@@ -27,7 +29,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pandas requests
+          pip install pandas requests lxml html5lib
 
       - name: Validate required files
         run: |
@@ -35,7 +37,22 @@ jobs:
           test -f data_client.py
           test -f eps_radar.py
           test -f notifier.py
-          test -f data/universe.csv
+          test -f build_universe.py
+
+      - name: Build universe
+        run: |
+          mkdir -p data
+          python build_universe.py
+
+      - name: Show universe preview
+        run: |
+          python - <<'PY'
+          import pandas as pd
+          df = pd.read_csv("data/universe.csv")
+          print("===== universe preview =====")
+          print("rows:", len(df))
+          print(df.head(20).to_string(index=False))
+          PY
 
       - name: Run radar
         run: |
@@ -43,8 +60,29 @@ jobs:
 
       - name: Show output preview
         run: |
-          echo "===== eps_radar_output.csv ====="
-          cat eps_radar_output.csv || true
+          python - <<'PY'
+          import pandas as pd
+          df = pd.read_csv("eps_radar_output.csv")
+          print("===== radar output preview =====")
+          print("rows:", len(df))
+          if len(df) > 0:
+              cols = [
+                  "ticker",
+                  "name",
+                  "signal_tier",
+                  "total_score",
+                  "expectation_upgrade_score",
+                  "growth_acceleration_score",
+                  "profitability_improvement_score",
+                  "valuation_score",
+                  "price_position_score",
+                  "health_flag",
+              ]
+              cols = [c for c in cols if c in df.columns]
+              print(df[cols].head(20).to_string(index=False))
+          else:
+              print("Empty output")
+          PY
 
       - name: Send telegram
         run: |
@@ -54,5 +92,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: fundamental-direction-radar-output
-          path: eps_radar_output.csv
+          path: |
+            data/universe.csv
+            eps_radar_output.csv
           if-no-files-found: error
