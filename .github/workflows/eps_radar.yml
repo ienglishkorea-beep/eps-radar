@@ -3,7 +3,6 @@ name: Fundamental Direction Radar
 on:
   workflow_dispatch:
   schedule:
-    # 한국시간 기준 평일 아침 8:10 = UTC 전일 23:10
     - cron: "10 23 * * 0-4"
 
 jobs:
@@ -13,6 +12,8 @@ jobs:
 
     env:
       TIINGO_API_KEY: ${{ secrets.TIINGO_API_KEY }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
 
     steps:
       - name: Checkout
@@ -33,6 +34,7 @@ jobs:
           test -f config.py
           test -f data_client.py
           test -f eps_radar.py
+          test -f notifier.py
           test -f data/universe.csv
 
       - name: Run radar
@@ -43,6 +45,10 @@ jobs:
         run: |
           echo "===== eps_radar_output.csv ====="
           cat eps_radar_output.csv || true
+
+      - name: Send telegram
+        run: |
+          python notifier.py
 
       - name: Upload output artifact
         uses: actions/upload-artifact@v4
