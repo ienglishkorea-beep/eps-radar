@@ -1,0 +1,815 @@
+import json
+import math
+import os
+from datetime import date, timedelta
+from typing import Any, Dict, List, Optional, Tuple, Set
+
+import pandas as pd
+from tiingo import TiingoClient
+
+from data_client import (
+    build_price_metrics,
+    download_price_history,
+    get_earnings_date_note_from_summary,
+    get_margin_data_from_summary,
+    get_profile_from_summary,
+    get_quote_info,
+    get_quote_summary_modules,
+    get_revenue_growth_from_summary,
+    get_sp1500_tickers,
+    safe_float,
+)
+
+# =========================================================
+# MODE
+# ---------------------------------------------------------
+# 지금은 Tiingo fundamentals field 존재 확인이 목적이다.
+# True면 probe만 돌리고 종료한다.
+# False로 바꾸면 기존 EPS Radar 흐름으로 다시 들어간다.
+# =========================================================
+TIINGO_PROBE_ONLY = True
+TIINGO_PROBE_TICKERS = ["MSFT", "AVGO"]
+TIINGO_PROBE_LOOKBACK_DAYS = 730
+TIINGO_PROBE_OUT_DIR = "tiingo_probe_output"
+
+# 찾고 싶은 개념
+TIINGO_TARGETS: Dict[str, List[str]] = {
+    "revenue_growth": ["revenue growth", "sales growth", "yoy revenue", "yoy sales"],
+    "gross_margin": ["gross margin", "gross profit margin"],
+    "operating_margin": ["operating margin", "ebit margin", "ebita margin"],
+    "net_margin": ["net income margin", "net margin"],
+    "roic": ["roic", "return on invested capital"],
+    "pe": ["pe ratio", "price earnings", "price / earnings"],
+    "ev_sales": ["ev/sales", "enterprise value sales"],
+    "ev_ebitda": ["ev/ebitda", "enterprise value ebitda"],
+    "ev_ebit": ["ev/ebit", "enterprise value ebit"],
+    "cfo": ["cash from operations", "operating cash flow"],
+    "cfo_growth": ["cash from operations growth", "operating cash flow growth"],
+    "capex": ["capital expenditure", "capex"],
+    "capex_growth": ["capital expenditure growth", "capex growth"],
+    "debt": ["total debt", "debt"],
+    "enterprise_value": ["enterprise value"],
+    "market_cap": ["market cap", "market capitalization"],
+    "gross_profit": ["gross profit"],
+    "operating_income": ["operating income", "ebit"],
+    "net_income": ["net income"],
+}
+
+MIN_PRICE = 10.0
+MIN_AVG_DOLLAR_VOLUME = 10_000_000
+
+STAGE0_HIGH_PROXIMITY = 0.72
+STAGE0_RELAXED_HIGH_PROXIMITY = 0.68
+STAGE0_MAX_COUNT = 240
+STAGE0_RELAXED_MAX_COUNT = 360
+
+STAGE1_PROXY_THRESHOLD = 60.0
+RELAXED_STAGE1_PROXY_THRESHOLD = 56.0
+AUTO_RELAX_IF_FINAL_LT = 5
+
+MIN_REVENUE_GROWTH = 0.15
+MIN_HIGH_PROXIMITY = 0.80
+RELAXED_HIGH_PROXIMITY = 0.72
+MIN_VOLUME_RATIO = 1.0
+MIN_RS_OVER_SPY = 0.00
+
+QUALITY_REVENUE_GROWTH = 0.20
+QUALITY_GROSS_MARGIN = 0.45
+QUALITY_OPERATING_MARGIN = 0.15
+
+SUPPLY_DRYUP_VOL_RATIO_MAX = 0.85
+SUPPLY_DRYUP_RANGE_RATIO_MAX = 0.85
+TIGHT_RANGE_10D_MAX = 0.08
+MAX_EXTENSION_FROM_MA50 = 0.25
+VCP_BASE_LOOKBACK = 60
+VCP_MAX_BASE_DEPTH = 0.30
+
+MIN_INDUSTRY_SIZE = 3
+TOP_INDUSTRY_RANK_RATIO = 0.20
+
+SECTOR_MAP = {
+    "Technology": "XLK",
+    "Semiconductors": "SMH",
+    "Consumer Cyclical": "XLY",
+    "Consumer Defensive": "XLP",
+    "Healthcare": "XLV",
+    "Financial Services": "XLF",
+    "Financial": "XLF",
+    "Industrials": "XLI",
+    "Energy": "XLE",
+    "Basic Materials": "XLB",
+    "Materials": "XLB",
+    "Real Estate": "XLRE",
+    "Utilities": "XLU",
+    "Communication Services": "XLC",
+}
+
+OUTPUT_COLS = [
+    "ticker",
+    "name",
+    "grade",
+    "multibagger_potential",
+    "is_ultra",
+    "is_multibagger",
+    "signal_stage",
+    "action",
+    "expectation_upgrade_score",
+    "expectation_band",
+    "guidance_tone_proxy",
+    "guidance_signal",
+    "growth_accel_tag",
+    "growth_accel_proxy",
+    "quality_proxy_tag",
+    "score",
+    "revenue_growth",
+    "gross_margin",
+    "operating_margin",
+    "price",
+    "entry_price",
+    "stop_price",
+    "high_20d",
+    "sector",
+    "industry",
+    "sector_etf",
+    "ret_6m",
+    "sector_ret_6m",
+    "spy_ret_6m",
+    "ret_3m",
+    "sector_ret_3m",
+    "spy_ret_3m",
+    "ma50",
+    "ma200",
+    "high_52w",
+    "high_proximity",
+    "volume",
+    "avg_volume_3m",
+    "volume_ratio",
+    "avg_dollar_volume",
+    "industry_avg_ret_6m",
+    "industry_avg_ret_3m",
+    "industry_rank",
+    "industry_rank_ratio",
+    "industry_size",
+    "industry_breadth_pct",
+    "rs_line_high",
+    "supply_dryup",
+    "supply_dryup_vol_ratio",
+    "supply_dryup_range_ratio",
+    "tight_structure",
+    "tight_range_10d",
+    "entry_quality_tag",
+    "vcp_ready",
+    "vcp_score",
+    "base_depth",
+    "earnings_date_note",
+]
+
+DEBUG_SAMPLE_N = 5
+
+
+# =========================================================
+# Tiingo probe helpers
+# =========================================================
+def ensure_dir(path: str) -> None:
+    os.makedirs(path, exist_ok=True)
+
+
+def save_json(path: str, data: Any) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2, default=str)
+
+
+def norm(x: Any) -> str:
+    if x is None:
+        return ""
+    s = str(x).strip().lower()
+    for ch in ["/", "-", "_", "(", ")", "%", ":", ",", ".", "[", "]"]:
+        s = s.replace(ch, " ")
+    while "  " in s:
+        s = s.replace("  ", " ")
+    return s.strip()
+
+
+def flatten_keys(obj: Any, prefix: str = "", out: Optional[List[str]] = None) -> List[str]:
+    if out is None:
+        out = []
+
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            key_path = f"{prefix}.{k}" if prefix else str(k)
+            out.append(key_path)
+            flatten_keys(v, key_path, out)
+    elif isinstance(obj, list):
+        for i, item in enumerate(obj[:100]):
+            key_path = f"{prefix}[{i}]"
+            out.append(key_path)
+            flatten_keys(item, key_path, out)
+
+    return out
+
+
+def any_match(texts: List[str], keywords: List[str]) -> bool:
+    joined = " | ".join([norm(t) for t in texts if t is not None])
+    return any(norm(k) in joined for k in keywords)
+
+
+def build_tiingo_client() -> TiingoClient:
+    api_key = os.getenv("TIINGO_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("TIINGO_API_KEY 환경변수가 비어 있다.")
+
+    config = {
+        "api_key": api_key,
+        "session": True,
+    }
+    return TiingoClient(config)
+
+
+def fetch_tiingo_definitions(client: TiingoClient, ticker: str) -> List[Dict[str, Any]]:
+    defs = client.get_fundamentals_definitions(ticker)
+    if isinstance(defs, list):
+        return defs
+    if isinstance(defs, dict):
+        return [defs]
+    return []
+
+
+def fetch_tiingo_daily(client: TiingoClient, ticker: str) -> Any:
+    end_date = date.today()
+    start_date = end_date - timedelta(days=TIINGO_PROBE_LOOKBACK_DAYS)
+    return client.get_fundamentals_daily(
+        ticker,
+        startDate=start_date.isoformat(),
+        endDate=end_date.isoformat(),
+    )
+
+
+def fetch_tiingo_statements(client: TiingoClient, ticker: str) -> Any:
+    end_date = date.today()
+    start_date = end_date - timedelta(days=TIINGO_PROBE_LOOKBACK_DAYS)
+    return client.get_fundamentals_statements(
+        ticker,
+        startDate=start_date.isoformat(),
+        endDate=end_date.isoformat(),
+        asReported=True,
+    )
+
+
+def find_definition_matches(definitions: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+    matches: Dict[str, List[Dict[str, Any]]] = {k: [] for k in TIINGO_TARGETS.keys()}
+
+    for row in definitions:
+        texts = [
+            row.get("dataCode"),
+            row.get("name"),
+            row.get("description"),
+            row.get("statementType"),
+            row.get("units"),
+        ]
+
+        for target_name, keywords in TIINGO_TARGETS.items():
+            if any_match(texts, keywords):
+                matches[target_name].append(
+                    {
+                        "dataCode": row.get("dataCode"),
+                        "name": row.get("name"),
+                        "statementType": row.get("statementType"),
+                        "units": row.get("units"),
+                        "description": row.get("description"),
+                    }
+                )
+
+    for k, rows in matches.items():
+        seen: Set[Tuple[Any, Any]] = set()
+        deduped = []
+        for r in rows:
+            key = (r.get("dataCode"), r.get("name"))
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(r)
+        matches[k] = deduped
+
+    return matches
+
+
+def summarize_presence(
+    daily_raw: Any,
+    statements_raw: Any,
+    matched_definitions: Dict[str, List[Dict[str, Any]]],
+) -> Dict[str, Dict[str, Any]]:
+    report: Dict[str, Dict[str, Any]] = {}
+
+    daily_paths = flatten_keys(daily_raw)
+    statements_paths = flatten_keys(statements_raw)
+
+    daily_paths_norm = [norm(x) for x in daily_paths]
+    statements_paths_norm = [norm(x) for x in statements_paths]
+
+    for target_name, defs in matched_definitions.items():
+        candidate_codes = [d.get("dataCode") for d in defs if d.get("dataCode")]
+        candidate_names = [d.get("name") for d in defs if d.get("name")]
+        search_terms = candidate_codes + candidate_names + TIINGO_TARGETS[target_name]
+
+        daily_hits = []
+        statements_hits = []
+
+        for path, pnorm in zip(daily_paths, daily_paths_norm):
+            if any(norm(term) in pnorm for term in search_terms if term):
+                daily_hits.append(path)
+
+        for path, pnorm in zip(statements_paths, statements_paths_norm):
+            if any(norm(term) in pnorm for term in search_terms if term):
+                statements_hits.append(path)
+
+        report[target_name] = {
+            "candidate_dataCodes": candidate_codes,
+            "candidate_names": candidate_names,
+            "daily_hits": daily_hits[:50],
+            "statements_hits": statements_hits[:50],
+            "daily_present": len(daily_hits) > 0,
+            "statements_present": len(statements_hits) > 0,
+        }
+
+    return report
+
+
+def print_definition_report(matches: Dict[str, List[Dict[str, Any]]]) -> None:
+    print("\n" + "=" * 100)
+    print("[TIINGO DEFINITIONS MATCH REPORT]")
+    print("=" * 100)
+
+    for target_name, rows in matches.items():
+        print(f"\n[{target_name}]")
+        if not rows:
+            print("  - no definition match")
+            continue
+        for row in rows[:10]:
+            print(
+                f"  - dataCode={row.get('dataCode')} | "
+                f"name={row.get('name')} | "
+                f"statementType={row.get('statementType')} | "
+                f"units={row.get('units')}"
+            )
+
+
+def print_presence_report(ticker: str, report: Dict[str, Dict[str, Any]]) -> None:
+    print("\n" + "=" * 100)
+    print(f"[TIINGO PRESENCE REPORT] {ticker}")
+    print("=" * 100)
+
+    for target_name, info in report.items():
+        status = []
+        if info["daily_present"]:
+            status.append("daily")
+        if info["statements_present"]:
+            status.append("statements")
+        status_text = ",".join(status) if status else "missing"
+
+        print(f"\n[{target_name}] -> {status_text}")
+        if info["candidate_dataCodes"]:
+            print("  candidate_dataCodes:")
+            for x in info["candidate_dataCodes"][:10]:
+                print(f"    - {x}")
+        if info["daily_hits"]:
+            print("  daily_hits:")
+            for x in info["daily_hits"][:10]:
+                print(f"    - {x}")
+        if info["statements_hits"]:
+            print("  statements_hits:")
+            for x in info["statements_hits"][:10]:
+                print(f"    - {x}")
+
+
+def run_tiingo_probe() -> None:
+    ensure_dir(TIINGO_PROBE_OUT_DIR)
+
+    client = build_tiingo_client()
+
+    base_ticker = TIINGO_PROBE_TICKERS[0]
+    definitions = fetch_tiingo_definitions(client, base_ticker)
+    definition_matches = find_definition_matches(definitions)
+
+    save_json(os.path.join(TIINGO_PROBE_OUT_DIR, "definitions_raw.json"), definitions)
+    save_json(os.path.join(TIINGO_PROBE_OUT_DIR, "definitions_matches.json"), definition_matches)
+    print_definition_report(definition_matches)
+
+    for ticker in TIINGO_PROBE_TICKERS:
+        daily_raw = fetch_tiingo_daily(client, ticker)
+        statements_raw = fetch_tiingo_statements(client, ticker)
+
+        save_json(os.path.join(TIINGO_PROBE_OUT_DIR, f"{ticker.lower()}_daily_raw.json"), daily_raw)
+        save_json(os.path.join(TIINGO_PROBE_OUT_DIR, f"{ticker.lower()}_statements_raw.json"), statements_raw)
+
+        presence = summarize_presence(daily_raw, statements_raw, definition_matches)
+        save_json(os.path.join(TIINGO_PROBE_OUT_DIR, f"{ticker.lower()}_presence_report.json"), presence)
+        print_presence_report(ticker, presence)
+
+    print("\n완료")
+    print(f"출력 폴더: {TIINGO_PROBE_OUT_DIR}")
+    print("다음에 볼 파일:")
+    print(" - definitions_matches.json")
+    print(" - msft_presence_report.json")
+    print(" - avgo_presence_report.json")
+
+
+# =========================================================
+# 기존 EPS Radar 로직
+# ---------------------------------------------------------
+# 아래는 지금은 probe only 모드에선 실행되지 않는다.
+# =========================================================
+def clamp01(x: float) -> float:
+    return max(0.0, min(1.0, x))
+
+
+def init_diag() -> Dict[str, int]:
+    return {
+        "price_history_missing_count": 0,
+        "quote_missing_count": 0,
+        "summary_missing_count": 0,
+        "name_present_count": 0,
+        "sector_present_count": 0,
+        "industry_present_count": 0,
+        "revenue_growth_present_count": 0,
+        "gross_margin_present_count": 0,
+        "operating_margin_present_count": 0,
+        "stage0_price_below_min": 0,
+        "stage0_avg_dollar_volume_below_min": 0,
+        "stage0_trend_filter_fail": 0,
+        "stage0_rs_filter_fail": 0,
+        "stage0_high_proximity_fail": 0,
+        "sector_missing": 0,
+        "industry_missing": 0,
+        "sector_etf_missing": 0,
+        "sector_return_missing": 0,
+        "revenue_growth_missing": 0,
+        "revenue_growth_below_min": 0,
+        "high_proximity_below_min": 0,
+        "volume_ratio_below_min": 0,
+        "expectation_proxy_below_threshold": 0,
+    }
+
+
+def merge_diag(base: Dict[str, int], extra: Dict[str, int]) -> Dict[str, int]:
+    out = dict(base)
+    for k, v in extra.items():
+        out[k] = out.get(k, 0) + int(v)
+    return out
+
+
+def compute_return_from_history(df: pd.DataFrame, lookback_days: int) -> Optional[float]:
+    if df.empty or len(df) < lookback_days + 1:
+        return None
+    start_price = safe_float(df["close"].iloc[-(lookback_days + 1)])
+    end_price = safe_float(df["close"].iloc[-1])
+    if start_price in [None, 0] or end_price is None:
+        return None
+    try:
+        return (end_price / start_price) - 1.0
+    except Exception:
+        return None
+
+
+def compute_range_ratio(df: pd.DataFrame, window: int) -> Optional[float]:
+    if df.empty or len(df) < window:
+        return None
+    high_n = safe_float(df["high"].tail(window).max())
+    low_n = safe_float(df["low"].tail(window).min())
+    if high_n in [None, 0] or low_n is None:
+        return None
+    return (high_n - low_n) / high_n
+
+
+def compute_supply_dryup(df: pd.DataFrame) -> Tuple[bool, Optional[float], Optional[float]]:
+    if df.empty or len(df) < 30:
+        return False, None, None
+
+    vol_5d = safe_float(df["volume"].tail(5).mean())
+    vol_20d = safe_float(df["volume"].tail(20).mean())
+    vol_ratio = None if vol_20d in [None, 0] else vol_5d / vol_20d
+
+    range_10d = compute_range_ratio(df, 10)
+    range_30d = compute_range_ratio(df, 30)
+    range_ratio = None if range_10d is None or range_30d in [None, 0] else range_10d / range_30d
+
+    is_ok = (
+        vol_ratio is not None
+        and range_ratio is not None
+        and vol_ratio <= SUPPLY_DRYUP_VOL_RATIO_MAX
+        and range_ratio <= SUPPLY_DRYUP_RANGE_RATIO_MAX
+    )
+    return bool(is_ok), vol_ratio, range_ratio
+
+
+def compute_rs_line_high(stock_df: pd.DataFrame, spy_df: pd.DataFrame, lookback: int = 126) -> bool:
+    if stock_df.empty or spy_df.empty:
+        return False
+
+    merged = stock_df[["date", "close"]].merge(
+        spy_df[["date", "close"]].rename(columns={"close": "spy_close"}),
+        on="date",
+        how="inner",
+    )
+    if merged.empty or len(merged) < lookback:
+        return False
+
+    merged["rs_line"] = merged["close"] / merged["spy_close"]
+    current = safe_float(merged["rs_line"].iloc[-1])
+    prev_high = safe_float(merged["rs_line"].tail(lookback).iloc[:-1].max())
+    if current is None or prev_high is None:
+        return False
+    return current >= prev_high
+
+
+def compute_entry_quality_tag(
+    price: float,
+    ma50: float,
+    ma200: float,
+    high_52w: float,
+    high_20d: float,
+    tight_range_10d: Optional[float],
+) -> str:
+    if (
+        price is not None
+        and ma50 is not None
+        and ma200 is not None
+        and high_52w not in [None, 0]
+        and high_20d not in [None, 0]
+        and price > ma50 > ma200
+    ):
+        high_proximity = price / high_52w
+        dist_20d = price / high_20d
+        extension_ma50 = (price / ma50) - 1.0
+
+        if (
+            high_proximity >= 0.90
+            and dist_20d >= 0.95
+            and extension_ma50 <= MAX_EXTENSION_FROM_MA50
+            and tight_range_10d is not None
+            and tight_range_10d <= TIGHT_RANGE_10D_MAX
+        ):
+            return "READY"
+        return "SETUP"
+    return "LOOSE"
+
+
+def compute_vcp_features(df: pd.DataFrame) -> Dict[str, Optional[float]]:
+    if df.empty or len(df) < VCP_BASE_LOOKBACK:
+        return {
+            "vcp_ready": False,
+            "vcp_score": 0.0,
+            "tight_range_10d": None,
+            "base_depth": None,
+        }
+
+    base = df.tail(VCP_BASE_LOOKBACK).copy()
+    high_base = safe_float(base["high"].max())
+    low_base = safe_float(base["low"].min())
+    if high_base in [None, 0] or low_base is None:
+        return {
+            "vcp_ready": False,
+            "vcp_score": 0.0,
+            "tight_range_10d": None,
+            "base_depth": None,
+        }
+
+    base_depth = (high_base - low_base) / high_base
+    tight_range_10d = compute_range_ratio(df, 10)
+    supply_dryup, _, _ = compute_supply_dryup(df)
+
+    price = safe_float(df["close"].iloc[-1])
+    ma50 = safe_float(df["close"].rolling(50).mean().iloc[-1])
+    ma200 = safe_float(df["close"].rolling(200).mean().iloc[-1]) if len(df) >= 200 else None
+    high_52w = safe_float(df["high"].tail(252).max()) if len(df) >= 252 else safe_float(df["high"].max())
+
+    near_high = False
+    if price is not None and high_52w not in [None, 0]:
+        near_high = (price / high_52w) >= 0.85
+
+    price_stack_ok = (
+        price is not None
+        and ma50 is not None
+        and ma200 is not None
+        and price > ma50 > ma200
+    )
+
+    tight_ok = tight_range_10d is not None and tight_range_10d <= TIGHT_RANGE_10D_MAX
+    base_ok = base_depth <= VCP_MAX_BASE_DEPTH
+    vcp_ready = bool(price_stack_ok and near_high and tight_ok and supply_dryup and base_ok)
+
+    score = 0.0
+    if price_stack_ok:
+        score += 1.0
+    if near_high:
+        score += 1.0
+    if tight_ok:
+        score += 1.0
+    if supply_dryup:
+        score += 1.0
+    if base_depth <= 0.20:
+        score += 1.0
+    elif base_ok:
+        score += 0.5
+
+    return {
+        "vcp_ready": vcp_ready,
+        "vcp_score": round(score, 2),
+        "tight_range_10d": round(tight_range_10d, 4) if tight_range_10d is not None else None,
+        "base_depth": round(base_depth, 4),
+    }
+
+
+def expectation_band(score: float) -> str:
+    if score >= 80:
+        return "VERY_STRONG"
+    if score >= 70:
+        return "STRONG"
+    if score >= 60:
+        return "VALID"
+    if score >= 50:
+        return "WATCH"
+    return "WEAK"
+
+
+def get_signal_stage(proxy_score: float) -> str:
+    if proxy_score >= 80:
+        return "ACCELERATING"
+    if proxy_score >= 70:
+        return "EARLY"
+    if proxy_score >= 60:
+        return "INITIAL"
+    return "WATCH"
+
+
+def get_action(proxy_score: float) -> str:
+    if proxy_score >= 70:
+        return "BUY"
+    if proxy_score >= 60:
+        return "WATCH"
+    return "NO_ENTRY"
+
+
+def get_growth_accel_proxy(
+    revenue_growth: float,
+    high_proximity: float,
+    stock_ret_6m: float,
+    sector_ret_6m: float,
+    spy_ret_6m: float,
+    stock_ret_3m: float,
+    sector_ret_3m: float,
+    spy_ret_3m: float,
+    rs_line_high: bool,
+) -> float:
+    rev_part = 1.0 if revenue_growth >= 0.30 else 0.8 if revenue_growth >= 0.20 else 0.6 if revenue_growth >= 0.15 else 0.0
+    breakout_part = 1.0 if high_proximity >= 0.95 else 0.7 if high_proximity >= 0.90 else 0.4 if high_proximity >= 0.85 else 0.0
+    rs_6m_part = 1.0 if stock_ret_6m > sector_ret_6m > spy_ret_6m else 0.5 if stock_ret_6m > spy_ret_6m else 0.0
+    rs_3m_part = 1.0 if stock_ret_3m > sector_ret_3m > spy_ret_3m else 0.5 if stock_ret_3m > spy_ret_3m else 0.0
+    rs_line_part = 1.0 if rs_line_high else 0.0
+
+    proxy = (
+        0.30 * rev_part
+        + 0.20 * breakout_part
+        + 0.20 * rs_6m_part
+        + 0.20 * rs_3m_part
+        + 0.10 * rs_line_part
+    )
+    return round(proxy, 2)
+
+
+def get_growth_accel_tag(
+    revenue_growth: float,
+    high_proximity: float,
+    stock_ret_6m: float,
+    sector_ret_6m: float,
+    spy_ret_6m: float,
+    stock_ret_3m: float,
+    sector_ret_3m: float,
+    spy_ret_3m: float,
+    rs_line_high: bool,
+) -> str:
+    rs_6m_strong = stock_ret_6m > sector_ret_6m > spy_ret_6m
+    rs_3m_strong = stock_ret_3m > sector_ret_3m > spy_ret_3m
+
+    if revenue_growth >= 0.20 and high_proximity >= 0.90 and rs_6m_strong and rs_3m_strong and rs_line_high:
+        return "ACCEL"
+    if revenue_growth >= 0.15 and (rs_6m_strong or rs_3m_strong):
+        return "EARLY"
+    return "NORMAL"
+
+
+def get_quality_proxy_tag(
+    revenue_growth: Optional[float],
+    gross_margin: Optional[float],
+    operating_margin: Optional[float],
+) -> str:
+    if (
+        revenue_growth is not None
+        and gross_margin is not None
+        and operating_margin is not None
+        and revenue_growth >= QUALITY_REVENUE_GROWTH
+        and gross_margin >= QUALITY_GROSS_MARGIN
+        and operating_margin >= QUALITY_OPERATING_MARGIN
+    ):
+        return "QUALITY"
+    return "NORMAL"
+
+
+def get_multibagger_flag(
+    revenue_growth: Optional[float],
+    gross_margin: Optional[float],
+    operating_margin: Optional[float],
+    growth_accel_tag: str,
+    high_proximity: float,
+    rs_line_high: bool,
+    tight_structure: bool,
+    vcp_ready: bool,
+) -> bool:
+    if revenue_growth is None or gross_margin is None or operating_margin is None:
+        return False
+
+    base_quality = (
+        revenue_growth >= QUALITY_REVENUE_GROWTH
+        and gross_margin >= QUALITY_GROSS_MARGIN
+        and operating_margin >= QUALITY_OPERATING_MARGIN
+    )
+
+    extra_checks = 0
+    if growth_accel_tag == "ACCEL":
+        extra_checks += 1
+    if high_proximity >= 0.90:
+        extra_checks += 1
+    if rs_line_high:
+        extra_checks += 1
+    if tight_structure or vcp_ready:
+        extra_checks += 1
+
+    return bool(base_quality and extra_checks >= 2)
+
+
+def compute_expectation_upgrade_proxy(
+    revenue_growth: Optional[float],
+    gross_margin: Optional[float],
+    operating_margin: Optional[float],
+    ret_3m: Optional[float],
+    ret_6m: Optional[float],
+    sector_ret_3m: Optional[float],
+    sector_ret_6m: Optional[float],
+    spy_ret_3m: Optional[float],
+    spy_ret_6m: Optional[float],
+    high_proximity: Optional[float],
+    rs_line_high: bool,
+    tight_structure: bool,
+    vcp_ready: bool,
+    supply_dryup: bool,
+) -> float:
+    if revenue_growth is None:
+        growth_score = 0.0
+    elif revenue_growth >= 0.35:
+        growth_score = 1.0
+    elif revenue_growth >= 0.25:
+        growth_score = 0.8
+    elif revenue_growth >= 0.15:
+        growth_score = 0.6
+    elif revenue_growth >= 0.08:
+        growth_score = 0.3
+    else:
+        growth_score = 0.0
+
+    quality_score = 0.0
+    quality_checks = 0
+    if gross_margin is not None:
+        quality_checks += 1
+        quality_score += 1.0 if gross_margin >= QUALITY_GROSS_MARGIN else 0.5 if gross_margin >= 0.35 else 0.0
+    if operating_margin is not None:
+        quality_checks += 1
+        quality_score += 1.0 if operating_margin >= QUALITY_OPERATING_MARGIN else 0.5 if operating_margin >= 0.08 else 0.0
+    if quality_checks > 0:
+        quality_score = quality_score / quality_checks
+
+    trend_score = 0.0
+    trend_parts = 0
+    if ret_6m is not None and sector_ret_6m is not None and spy_ret_6m is not None:
+        trend_parts += 1
+        if ret_6m > sector_ret_6m > spy_ret_6m:
+            trend_score += 1.0
+        elif ret_6m > spy_ret_6m:
+            trend_score += 0.5
+    if ret_3m is not None and sector_ret_3m is not None and spy_ret_3m is not None:
+        trend_parts += 1
+        if ret_3m > sector_ret_3m > spy_ret_3m:
+            trend_score += 1.0
+        elif ret_3m > spy_ret_3m:
+            trend_score += 0.5
+    if trend_parts > 0:
+        trend_score = trend_score / trend_parts
+
+    structure_score = 0.0
+    if high_proximity is not None:
+        if high_proximity >= 0.95:
+            structure_score += 0.35
+        elif high_proximity >= 0.90:
+            structure_score += 0.25
+        elif high_proximity >= 0.85:
+            structure_score += 0.15
+
+    if rs_line
