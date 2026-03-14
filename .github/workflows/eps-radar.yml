@@ -13,6 +13,8 @@ jobs:
       TIINGO_API_KEY: ${{ secrets.TIINGO_API_KEY }}
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      DEBUG_TIINGO: "1"
+      DEBUG_TIINGO_SAMPLE_TICKERS: "MSFT,NVDA"
 
     steps:
       - name: Checkout repository
@@ -101,6 +103,36 @@ jobs:
                       or line.startswith("Multibagger candidates:")
                       or line.startswith("No final candidates")
                       or line.startswith("SPY fetch failed.")
+                      or line.startswith("Diagnostics")
+                      or line.startswith("price_history_missing_count:")
+                      or line.startswith("quote_missing_count:")
+                      or line.startswith("summary_missing_count:")
+                      or line.startswith("market_cap_present_count:")
+                      or line.startswith("sector_present_count:")
+                      or line.startswith("industry_present_count:")
+                      or line.startswith("revenue_growth_present_count:")
+                      or line.startswith("gross_margin_present_count:")
+                      or line.startswith("operating_margin_present_count:")
+                      or line.startswith("stage0_price_below_min:")
+                      or line.startswith("stage0_avg_dollar_volume_below_min:")
+                      or line.startswith("stage0_trend_filter_fail:")
+                      or line.startswith("stage0_rs_filter_fail:")
+                      or line.startswith("stage0_high_proximity_fail:")
+                      or line.startswith("market_cap_missing:")
+                      or line.startswith("market_cap_below_min:")
+                      or line.startswith("sector_missing:")
+                      or line.startswith("industry_missing:")
+                      or line.startswith("sector_etf_missing:")
+                      or line.startswith("sector_return_missing:")
+                      or line.startswith("revenue_growth_missing:")
+                      or line.startswith("revenue_growth_below_min:")
+                      or line.startswith("high_proximity_below_min:")
+                      or line.startswith("volume_ratio_below_min:")
+                      or line.startswith("expectation_proxy_below_threshold:")
+                      or line.startswith("DEBUG QUOTE_INFO_RESULT")
+                      or line.startswith("DEBUG PROFILE_RESULT")
+                      or line.startswith("DEBUG REVENUE_GROWTH_RESULT")
+                      or line.startswith("DEBUG MARGIN_RESULT")
                   ):
                       summary_lines.append(line)
 
@@ -113,7 +145,15 @@ jobs:
           if top_df is None or top_df.empty:
               summary_lines.append("")
               summary_lines.append("No candidates today.")
-              send_message("\n".join(summary_lines).strip())
+              message = "\n".join(summary_lines).strip()
+
+              max_len = 3500
+              if len(message) <= max_len:
+                  send_message(message)
+              else:
+                  chunks = [message[i:i+max_len] for i in range(0, len(message), max_len)]
+                  for chunk in chunks:
+                      send_message(chunk)
               raise SystemExit(0)
 
           keep_cols = [c for c in [
@@ -154,7 +194,15 @@ jobs:
               summary_lines.append(f"tone {tone} | accel {accel} | quality {quality}")
               summary_lines.append("")
 
-          send_message("\n".join(summary_lines).strip())
+          message = "\n".join(summary_lines).strip()
+
+          max_len = 3500
+          if len(message) <= max_len:
+              send_message(message)
+          else:
+              chunks = [message[i:i+max_len] for i in range(0, len(message), max_len)]
+              for chunk in chunks:
+                  send_message(chunk)
           PY
 
       - name: Show generated files
