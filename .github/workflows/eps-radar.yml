@@ -1,13 +1,16 @@
-name: run-eps-radar
+name: EPS Radar Daily Summary
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "30 22 * * 1-5"
+    - cron: "10 22 * * 1-5"
 
 jobs:
-  run:
+  run-eps-radar:
     runs-on: ubuntu-latest
+
+    env:
+      TIINGO_API_KEY: ${{ secrets.TIINGO_API_KEY }}
 
     steps:
       - name: Checkout repository
@@ -21,66 +24,37 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pandas numpy requests yfinance openpyxl lxml
+          pip install pandas requests lxml html5lib beautifulsoup4
 
-      - name: Run EPS Radar Engine
-        id: eps_run
-        continue-on-error: true
+      - name: Run EPS Radar
         run: |
-          python eps_radar.py > eps_radar_run.log 2>&1
-          echo "exit_code=$?" >> $GITHUB_OUTPUT
-          cat eps_radar_run.log
+          python eps_radar.py
 
-      - name: Send EPS Daily Telegram Summary
+      - name: Show generated files
         if: always()
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          python - <<'PY'
-          import os
-          import requests
+          ls -lah
+          echo ""
+          echo "eps_candidates.csv"
+          test -f eps_candidates.csv && wc -l eps_candidates.csv || true
+          echo ""
+          echo "top_candidates.csv"
+          test -f top_candidates.csv && wc -l top_candidates.csv || true
+          echo ""
+          echo "ultra_candidates.csv"
+          test -f ultra_candidates.csv && wc -l ultra_candidates.csv || true
+          echo ""
+          echo "multibagger_candidates.csv"
+          test -f multibagger_candidates.csv && wc -l multibagger_candidates.csv || true
 
-          token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-          chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-
-          if not token or not chat_id:
-              raise RuntimeError("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID")
-
-          try:
-              with open("eps_radar_run.log", "r", encoding="utf-8", errors="ignore") as f:
-                  log_text = f.read().strip()
-          except FileNotFoundError:
-              log_text = "eps_radar_run.log not found"
-
-          if not log_text:
-              log_text = "No EPS Radar output captured."
-
-          lines = [line.rstrip() for line in log_text.splitlines() if line.strip()]
-          tail = "\n".join(lines[-20:]) if lines else "No output"
-
-          msg = (
-              "EPS Radar Daily Summary\n\n"
-              f"{tail}"
-          )
-
-          url = f"https://api.telegram.org/bot{token}/sendMessage"
-          resp = requests.post(
-              url,
-              data={
-                  "chat_id": chat_id,
-                  "text": msg[:4000],
-                  "disable_web_page_preview": True,
-              },
-              timeout=30,
-          )
-
-          if resp.status_code != 200:
-              raise RuntimeError(f"Telegram send failed: {resp.status_code} {resp.text}")
-          PY
-
-      - name: Fail job if EPS Radar failed
-        if: steps.eps_run.outputs.exit_code != '0'
-        run: |
-          echo "EPS Radar failed. See eps_radar_run.log above."
-          exit 1
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eps-radar-output
+          path: |
+            eps_candidates.csv
+            top_candidates.csv
+            ultra_candidates.csv
+            multibagger_candidates.csv
+          if-no-files-found: warn
